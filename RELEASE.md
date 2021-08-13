@@ -8,6 +8,9 @@
     '--runtime_parameter=<parameter_name>=<parameter_value> --runtime_parameter
     =<parameter_name>=<parameter_value>'
 *   Added Manual node in the experimental orchestrator.
+*   Added `ImportSchemaGen` which is a dedicated component to import a
+    pre-defined schema file. ImportSchemaGen will replace `Importer` with
+    simpler syntax and less constraints.
 
 ## Breaking Changes
 

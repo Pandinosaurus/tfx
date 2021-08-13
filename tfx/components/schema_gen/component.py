@@ -52,8 +52,6 @@ class SchemaGen(base_component.BaseComponent):
   See [the SchemaGen guide](https://www.tensorflow.org/tfx/guide/schemagen)
   for more details.
   """
-  # TODO(b/123941608): Update pydoc about how to use a user provided schema
-
   SPEC_CLASS = standard_component_specs.SchemaGenSpec
   EXECUTOR_SPEC = executor_spec.ExecutorClassSpec(executor.Executor)
 
