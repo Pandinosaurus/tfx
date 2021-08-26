@@ -7,6 +7,7 @@
     In the case of multiple runtime parameters, format is as follows:
     '--runtime_parameter=<parameter_name>=<parameter_value> --runtime_parameter
     =<parameter_name>=<parameter_value>'
+*   Placeholders support index access and JSON serialization for list type execution properties.
 
 ## Breaking Changes
 
