@@ -23,9 +23,9 @@ import numpy as np
 import tensorflow as tf
 import tensorflow_model_analysis as tfma
 from tensorflow_model_analysis import constants
-from tensorflow_model_analysis import model_util
 from tensorflow_model_analysis import types
 from tensorflow_model_analysis.extractors import extractor
+from tensorflow_model_analysis.utils import model_util
 from tfx_bsl.tfxio import tensor_adapter
 
 _PREDICT_EXTRACTOR_STAGE_NAME = 'SklearnPredict'
