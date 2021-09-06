@@ -20,6 +20,8 @@ import time
 from typing import List, Optional
 
 from absl import logging
+from google.cloud.aiplatform import pipeline_jobs
+from google.cloud.aiplatform.compat.types import pipeline_state_v1beta1
 from kfp.pipeline_spec import pipeline_spec_pb2 as pipeline_pb2
 import tensorflow_model_analysis as tfma
 from tfx import components
@@ -73,20 +75,23 @@ TEST_RUNTIME_CONFIG = pipeline_pb2.PipelineJob.RuntimeConfig(
     })
 
 
-_VERTEX_SUCCEEDED_STATE = 'PIPELINE_STATE_SUCCEEDED'
+_PIPELINE_COMPLETE_STATES = frozenset(
+    [
+        pipeline_state_v1beta1.PipelineState.PIPELINE_STATE_SUCCEEDED,
+        pipeline_state_v1beta1.PipelineState.PIPELINE_STATE_FAILED,
+        pipeline_state_v1beta1.PipelineState.PIPELINE_STATE_CANCELLED,
+        pipeline_state_v1beta1.PipelineState.PIPELINE_STATE_PAUSED,
+    ]
+)
 
-_VERTEX_RUNNING_STATES = frozenset(
-    ('PIPELINE_STATE_QUEUED', 'PIPELINE_STATE_PENDING',
-     'PIPELINE_STATE_RUNNING'))
 
-
-# TODO(b/182792980): Add type annotation for the client.
-def poll_job_status(vertex_client, job_id: str,
-                    timeout: datetime.timedelta, polling_interval_secs: int):
+def poll_job_status(job_id: str, timeout: datetime.timedelta,
+                    polling_interval_secs: int):
   """Checks the status of the job.
 
+  NOTE: aiplatform.init() should be already called.
+
   Args:
-    vertex_client: Vertex Pipelines client object.
     job_id: The relative ID of the pipeline job.
     timeout: Timeout duration for the job execution.
     polling_interval_secs: Interval to check the job status.
@@ -99,15 +104,13 @@ def poll_job_status(vertex_client, job_id: str,
   while datetime.datetime.now() < deadline:
     time.sleep(polling_interval_secs)
 
-    response = vertex_client.get_job(job_id)
-    if not response or not response.get('state'):
-      raise RuntimeError('Unexpected response received: %s' % response)
-    state = response.get('state')
-    if state == _VERTEX_SUCCEEDED_STATE:
-      logging.info('Job succeeded: %s', response)
+    job = pipeline_jobs.PipelineJob.get(resource_name=job_id)
+    if (job.state ==
+        pipeline_state_v1beta1.PipelineState.PIPELINE_STATE_SUCCEEDED):
+      logging.info('Job succeeded: %s', job)
       return
-    if state not in _VERTEX_RUNNING_STATES:
-      raise RuntimeError('Job is in an unexpected state: %s' % response)
+    elif job.state in _PIPELINE_COMPLETE_STATES:
+      raise RuntimeError('Job is in an unexpected state: %s' % job.state)
 
   raise RuntimeError('Timed out waiting for job to finish.')
 

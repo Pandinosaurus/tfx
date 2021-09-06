@@ -19,7 +19,8 @@ from typing import List, Optional
 
 from absl.testing import parameterized
 
-from kfp.v2.google import client
+from google.cloud import aiplatform
+from google.cloud.aiplatform import pipeline_jobs
 
 import tensorflow as tf
 
@@ -48,9 +49,10 @@ class KubeflowV2E2ETestCase(kubeflow_v2_test_utils.BaseKubeflowV2Test):
 
   def setUp(self):
     super().setUp()
-    self._client = client.AIPlatformClient(
-        project_id=self._GCP_PROJECT_ID,
-        region=self._GCP_REGION)
+    aiplatform.init(
+        project=self._GCP_PROJECT_ID,
+        location=self._GCP_REGION,
+    )
 
   def _create_pipeline(
       self,
@@ -77,12 +79,11 @@ class KubeflowV2E2ETestCase(kubeflow_v2_test_utils.BaseKubeflowV2Test):
         config=config, output_filename='pipeline.json').run(
             pipeline, write_out=True)
 
-    self._client.create_run_from_job_spec(
-        job_spec_path='pipeline.json', job_id=job_id)
+    job = pipeline_jobs.PipelineJob(template_path='pipeline.json')
+    job.run(sync=False)
+    job.wait_for_resource_creation()
 
-  def _check_job_status(self, job_id: str) -> None:
-    kubeflow_v2_test_utils.poll_job_status(self._client, job_id,
-                                           _MAX_JOB_EXECUTION_TIME,
+    kubeflow_v2_test_utils.poll_job_status(job_id, _MAX_JOB_EXECUTION_TIME,
                                            _POLLING_INTERVAL_IN_SECONDS)
 
 
@@ -160,8 +161,6 @@ class KubeflowV2E2ETest(KubeflowV2E2ETestCase, parameterized.TestCase):
 
     self._run_pipeline(pipeline, pipeline_name)
 
-    self._check_job_status(pipeline_name)
-
   def testArtifactValuePlaceholders(self):
     component_instances = (
         kubeflow_v2_test_utils.tasks_for_pipeline_with_artifact_value_passing())
@@ -175,8 +174,6 @@ class KubeflowV2E2ETest(KubeflowV2E2ETestCase, parameterized.TestCase):
     )
 
     self._run_pipeline(pipeline, pipeline_name)
-
-    self._check_job_status(pipeline_name)
 
 
 if __name__ == '__main__':

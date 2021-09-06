@@ -20,7 +20,8 @@ import subprocess
 from absl import logging
 import docker
 from google.cloud import storage
-from kfp.v2.google import client
+from google.cloud import aiplatform
+
 import tensorflow as tf
 from tfx.experimental.templates import test_utils
 from tfx.orchestration import test_utils as orchestration_test_utils
@@ -145,10 +146,11 @@ class TaxiTemplateKubeflowV2E2ETest(test_utils.BaseEndToEndTest):
     return run_id_lines[0].split('|')[1].strip()
 
   def _wait_until_completed(self, run_id: str):
-    vertex_client = client.AIPlatformClient(
-        project_id=self._GCP_PROJECT_ID,
-        region=self._GCP_REGION)
-    kubeflow_v2_test_utils.poll_job_status(vertex_client, run_id,
+    aiplatform.init(
+        project=self._GCP_PROJECT_ID,
+        location=self._GCP_REGION,
+    )
+    kubeflow_v2_test_utils.poll_job_status(run_id,
                                            self._TIME_OUT,
                                            self._POLLING_INTERVAL_IN_SECONDS)
 
