@@ -13,7 +13,8 @@
 # limitations under the License.
 """TFXIO (standardized TFX inputs) related utilities."""
 
-from typing import Any, Callable, Dict, List, Iterator, Optional, Tuple, Union
+import logging
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import pyarrow as pa
 import tensorflow as tf
@@ -23,13 +24,17 @@ from tfx.proto import example_gen_pb2
 from tfx.types import artifact
 from tfx.types import standard_artifacts
 from tfx_bsl.tfxio import dataset_options
+from tfx_bsl.tfxio import parquet_tfxio
 from tfx_bsl.tfxio import raw_tf_record
 from tfx_bsl.tfxio import record_to_tensor_tfxio
 from tfx_bsl.tfxio import tf_example_record
 from tfx_bsl.tfxio import tf_sequence_example_record
 from tfx_bsl.tfxio import tfxio
+
 from tensorflow_metadata.proto.v0 import schema_pb2
 
+_SUPPORTED_FILE_FORMATS = (example_gen_pb2.FileFormat.FILE_FORMAT_PARQUET,
+                           example_gen_pb2.FileFormat.FORMAT_TFRECORDS_GZIP)
 # TODO(b/162532479): switch to support List[str] exclusively, once tfx-bsl
 # post-0.22 is released.
 OneOrMorePatterns = Union[str, List[str]]
@@ -76,7 +81,7 @@ def resolve_payload_format_and_data_view_uri(
   # DataView (the one with the largest create time). This will guarantee that
   # the RecordBatch read from each artifact will share the same Arrow schema
   # (and thus Tensors fed to TF graphs, if applicable). The DataView will need
-  # to guarantee backward compatibilty with older spans. Usually the DataView
+  # to guarantee backward compatibility with older spans. Usually the DataView
   # is a struct2tensor query, so such guarantee is provided by protobuf
   # (as long as the user follows the basic principles of making changes to
   # the proto).
@@ -89,6 +94,74 @@ def resolve_payload_format_and_data_view_uri(
       'Unable to resolve a DataView for the Examples Artifacts '
       'provided -- some Artifacts did not have DataView attached: {}'
       .format(violating_artifacts))
+
+
+def get_file_format_and_patterns(
+    examples: List[artifact.Artifact],
+    split: str,
+) -> Tuple[List[str], List[str]]:
+  """Get aligned lists of file patterns and formats for Examples artifacts."""
+  file_patterns, file_formats = [], []
+  for examples_artifact in examples:
+    file_pattern = examples_utils.get_split_file_patterns(
+        [examples_artifact], split
+    )
+    assert len(file_pattern) == 1
+    file_patterns.append(file_pattern[0])
+    file_formats.append(examples_utils.get_file_format(examples_artifact))
+  return file_patterns, file_formats
+
+
+def get_split_tfxio(
+    examples: List[artifact.Artifact],
+    split: str,
+    telemetry_descriptors: List[str],
+    schema: Optional[schema_pb2.Schema] = None,
+    read_as_raw_records: bool = False,
+    raw_record_column_name: Optional[str] = None,
+) -> tfxio.TFXIO:
+  """Returns a TFXIO for a single split.
+
+  Args:
+    examples: The Examples artifacts that the TFXIO is intended to access.
+    split: The split to read. Must be a split contained in examples.
+    telemetry_descriptors: A set of descriptors that identify the component that
+      is instantiating the TFXIO. These will be used to construct the namespace
+      to contain metrics for profiling and are therefore expected to be
+      identifiers of the component itself and not individual instances of source
+      use.
+    schema: TFMD schema. Note that without a schema, some TFXIO interfaces in
+      certain TFXIO implementations might not be available.
+    read_as_raw_records: If True, ignore the payload type of `examples`. Always
+      use RawTfRecord TFXIO.
+    raw_record_column_name: If provided, the arrow RecordBatch produced by the
+      TFXIO will contain a string column of the given name, and the contents of
+      that column will be the raw records. Note that not all TFXIO supports this
+      option, and an error will be raised in that case. Required if
+      read_as_raw_records == True.
+
+  Returns:
+    A function that takes a file pattern as input and returns a TFXIO
+    instance.
+
+  Raises:
+    NotImplementedError: when given an unsupported example payload type.
+  """
+  payload_format, data_view_uri = resolve_payload_format_and_data_view_uri(
+      examples
+  )
+  file_patterns, file_formats = get_file_format_and_patterns(examples, split)
+  logging.info('Reading from pattern %s for split %s', file_patterns, split)
+  return make_tfxio(
+      file_pattern=file_patterns,
+      file_format=file_formats,
+      telemetry_descriptors=telemetry_descriptors,
+      payload_format=payload_format,
+      data_view_uri=data_view_uri,
+      schema=schema,
+      read_as_raw_records=read_as_raw_records,
+      raw_record_column_name=raw_record_column_name,
+  )
 
 
 def get_tfxio_factory_from_artifact(
@@ -239,15 +312,24 @@ def get_data_view_decode_fn_from_artifact(
       raw_record_column_name=None).DecodeFunction()
 
 
+# TODO(b/216604827): Deprecate str file format.
+def _file_format_from_string(file_format: str) -> example_gen_pb2.FileFormat:
+  if file_format == 'tfrecords_gzip':
+    return example_gen_pb2.FileFormat.FORMAT_TFRECORDS_GZIP
+  else:
+    return example_gen_pb2.FileFormat.Value(file_format)
+
+
 def make_tfxio(
     file_pattern: OneOrMorePatterns,
     telemetry_descriptors: List[str],
-    payload_format: Union[str, int],
+    payload_format: int,
     data_view_uri: Optional[str] = None,
     schema: Optional[schema_pb2.Schema] = None,
     read_as_raw_records: bool = False,
     raw_record_column_name: Optional[str] = None,
-    file_format: Optional[Union[str, List[str]]] = None) -> tfxio.TFXIO:
+    file_format: Optional[Union[int, List[int], str, List[str]]] = None
+) -> tfxio.TFXIO:
   """Creates a TFXIO instance that reads `file_pattern`.
 
   Args:
@@ -271,8 +353,8 @@ def make_tfxio(
       that column will be the raw records. Note that not all TFXIO supports this
       option, and an error will be raised in that case. Required if
       read_as_raw_records == True.
-    file_format: file format string for each file_pattern. Only 'tfrecords_gzip'
-      is supported for now.
+    file_format: file format for each file_pattern. Only 'tfrecords_gzip' and
+      'parquet' are supported for now.
 
   Returns:
     a TFXIO instance.
@@ -291,10 +373,12 @@ def make_tfxio(
             f'The length of file_pattern and file_formats should be the same.'
             f'Given: file_pattern={file_pattern}, file_format={file_format}')
       else:
-        if any(item != 'tfrecords_gzip' for item in file_format):
+        file_format = [_file_format_from_string(item) for item in file_format]
+        if any(item not in _SUPPORTED_FILE_FORMATS for item in file_format):
           raise NotImplementedError(f'{file_format} is not supported yet.')
     else:  # file_format is str type.
-      if file_format != 'tfrecords_gzip':
+      file_format = _file_format_from_string(file_format)
+      if file_format not in _SUPPORTED_FILE_FORMATS:
         raise NotImplementedError(f'{file_format} is not supported yet.')
 
   if read_as_raw_records:
@@ -329,6 +413,12 @@ def make_tfxio(
         saved_decoder_path=data_view_uri,
         telemetry_descriptors=telemetry_descriptors,
         raw_record_column_name=raw_record_column_name)
+
+  if payload_format == example_gen_pb2.PayloadFormat.FORMAT_PARQUET:
+    return parquet_tfxio.ParquetTFXIO(
+        file_pattern=file_pattern,
+        schema=schema,
+        telemetry_descriptors=telemetry_descriptors)
 
   raise NotImplementedError(
       'Unsupport payload format: {}'.format(payload_format))

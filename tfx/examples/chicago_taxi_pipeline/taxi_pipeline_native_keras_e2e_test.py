@@ -14,7 +14,6 @@
 """E2E Tests for tfx.examples.chicago_taxi_pipeline.taxi_pipeline_native_keras."""
 
 import os
-import unittest
 
 from absl.testing import parameterized
 import tensorflow as tf
@@ -23,9 +22,9 @@ from tfx.examples.chicago_taxi_pipeline import taxi_pipeline_native_keras
 from tfx.orchestration import metadata
 from tfx.orchestration.beam.beam_dag_runner import BeamDagRunner
 
+import pytest
 
-@unittest.skipIf(tf.__version__ < '2',
-                 'Uses keras Model only compatible with TF 2.x')
+@pytest.mark.e2e
 class TaxiPipelineNativeKerasEndToEndTest(
     tf.test.TestCase, parameterized.TestCase):
 
@@ -63,7 +62,10 @@ class TaxiPipelineNativeKerasEndToEndTest(
     self.assertNotEmpty(outputs)
     for output in outputs:
       execution = fileio.listdir(os.path.join(component_path, output))
-      self.assertLen(execution, 1)
+      if output == '.system/stateful_working_dir':
+        self.assertEmpty(execution)
+      else:
+        self.assertLen(execution, 1)
 
   def assertPipelineExecution(self) -> None:
     self.assertExecutedOnce('CsvExampleGen')
@@ -134,8 +136,3 @@ class TaxiPipelineNativeKerasEndToEndTest(
       # Artifact count is unchanged.
       self.assertLen(m.store.get_artifacts(), artifact_count)
       self.assertLen(m.store.get_executions(), expected_execution_count * 3)
-
-
-if __name__ == '__main__':
-  tf.compat.v1.enable_v2_behavior()
-  tf.test.main()

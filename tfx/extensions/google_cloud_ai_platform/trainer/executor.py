@@ -25,6 +25,7 @@ from tfx.extensions.google_cloud_ai_platform.constants import VERTEX_REGION_KEY
 from tfx.types import standard_component_specs
 from tfx.utils import doc_controls
 from tfx.utils import json_utils
+from tfx.utils import name_utils
 
 TRAINING_ARGS_KEY = doc_controls.documented(
     obj='ai_platform_training_args',
@@ -40,6 +41,14 @@ TRAINING_ARGS_KEY = doc_controls.documented(
 JOB_ID_KEY = doc_controls.documented(
     obj='ai_platform_training_job_id',
     doc='Keys to the items in custom_config of Trainer for specifying job id.')
+
+LABELS_KEY = doc_controls.documented(
+    obj='ai_platform_training_labels',
+    doc='Keys to the items in custom_config of Trainer for specifying labels for '
+    'training jobs on the AI Platform only. Not applicable for Vertex AI, where labels '
+    'are specified in the CustomJob as defined in: '
+    'https://cloud.google.com/vertex-ai/docs/reference/rest/v1/projects.locations.customJobs#CustomJob.'
+)
 
 ENABLE_UCAIP_KEY = doc_controls.documented(
     obj='ai_platform_training_enable_ucaip',
@@ -97,6 +106,11 @@ class GenericExecutor(base_executor.BaseExecutor):
       absl.logging.error(err_msg)
       raise ValueError(err_msg)
 
+    job_labels = {
+        **job_args.get('labels', {}),
+        **custom_config.get(LABELS_KEY, {})
+    }
+
     job_id = custom_config.get(JOB_ID_KEY)
 
     enable_vertex = custom_config.get(
@@ -105,17 +119,15 @@ class GenericExecutor(base_executor.BaseExecutor):
                                       custom_config.get(UCAIP_REGION_KEY))
 
     executor_class = self._GetExecutorClass()
-    executor_class_path = '%s.%s' % (executor_class.__module__,
-                                     executor_class.__name__)
+    executor_class_path = name_utils.get_full_name(executor_class)
     # Note: exec_properties['custom_config'] here is a dict.
     return runner.start_cloud_training(input_dict, output_dict, exec_properties,
-                                       executor_class_path, job_args,
-                                       job_id, enable_vertex,
-                                       vertex_region)
+                                       executor_class_path, job_args, job_id,
+                                       job_labels, enable_vertex, vertex_region)
 
 
 class Executor(GenericExecutor):
   """Start a trainer job on Google Cloud AI Platform using a default Trainer."""
 
   def _GetExecutorClass(self):
-    return tfx_trainer_executor.Executor
+    return tfx_trainer_executor.GenericExecutor

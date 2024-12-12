@@ -26,6 +26,7 @@ from tfx.orchestration import metadata
 from tfx.orchestration import publisher
 from tfx.orchestration.launcher import in_process_component_launcher
 from tfx.proto import example_gen_pb2
+from tfx.utils import name_utils
 
 from ml_metadata.proto import metadata_store_pb2
 
@@ -86,15 +87,10 @@ class ExampleGenComponentWithParquetExecutorTest(tf.test.TestCase):
         additional_pipeline_args={})
     self.assertEqual(
         launcher._component_info.component_type,
-        '.'.join([FileBasedExampleGen.__module__,
-                  FileBasedExampleGen.__name__]))
+        name_utils.get_full_name(FileBasedExampleGen))
 
     launcher.launch()
     mock_publisher.return_value.publish_execution.assert_called_once()
 
     # Check output paths.
     self.assertTrue(fileio.exists(os.path.join(pipeline_root, example_gen.id)))
-
-
-if __name__ == '__main__':
-  tf.test.main()

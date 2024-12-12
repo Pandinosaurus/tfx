@@ -58,12 +58,12 @@ def _make_keras_model(hparams: keras_tuner.HyperParameters) -> tf.keras.Model:
   d = keras.layers.concatenate(inputs)
   for _ in range(int(hparams.get('num_layers'))):
     d = keras.layers.Dense(8, activation='relu')(d)
-  outputs = keras.layers.Dense(3, activation='softmax')(d)
+  outputs = keras.layers.Dense(3)(d)
 
   model = keras.Model(inputs=inputs, outputs=outputs)
   model.compile(
       optimizer=keras.optimizers.Adam(hparams.get('learning_rate')),
-      loss='sparse_categorical_crossentropy',
+      loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
       metrics=[keras.metrics.SparseCategoricalAccuracy()])
 
   model.summary(print_fn=absl.logging.info)
@@ -162,7 +162,7 @@ def run_fn(fn_args: tfx.components.FnArgs):
 
   # Write logs to path
   tensorboard_callback = tf.keras.callbacks.TensorBoard(
-      log_dir=fn_args.model_run_dir, update_freq='batch')
+      log_dir=fn_args.model_run_dir, update_freq='epoch')
 
   model.fit(
       train_dataset,
@@ -172,4 +172,4 @@ def run_fn(fn_args: tfx.components.FnArgs):
       callbacks=[tensorboard_callback])
 
   signatures = base.make_serving_signatures(model, tf_transform_output)
-  model.save(fn_args.serving_model_dir, save_format='tf', signatures=signatures)
+  tf.saved_model.save(model, fn_args.serving_model_dir, signatures=signatures)

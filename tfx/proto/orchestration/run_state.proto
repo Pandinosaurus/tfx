@@ -16,8 +16,11 @@ syntax = "proto3";
 
 package tfx.orchestration;
 
+option java_multiple_files = true;
+
 // Indicates the run state of a TFleX pipeline or a node.
 message RunState {
+  // Next Id: 9
   enum State {
     UNKNOWN = 0;
 
@@ -30,12 +33,13 @@ message RunState {
     // Run successfully completed.
     COMPLETE = 3;
 
-    // Only applicable to nodes. Indicates that the node run was skipped
-    // (e.g. due to condition not satisfied when pipeline has conditionals).
+    // Only applicable to nodes. Indicates that the node run was skipped due to
+    // condition not satisfied when pipeline has conditionals.
     SKIPPED = 4;
 
-    // Indicates that any active run is temporarily paused and may be resumed.
-    PAUSED = 5;
+    // Only applicable to nodes. Indicates that the node run was skipped due to
+    // partial run.
+    SKIPPED_PARTIAL_RUN = 8;
 
     // Indicates that the pipeline or node was stopped by an external agent.
     // When stopped, any associated active MLMD executions are cancelled.
@@ -43,6 +47,8 @@ message RunState {
 
     // Indicates failure to run to completion due to internal errors.
     FAILED = 7;
+
+    reserved 5;
   }
 
   State state = 1;
@@ -54,4 +60,7 @@ message RunState {
 
   StatusCodeValue status_code = 3;
   string status_msg = 2;
+
+  // Milliseconds since epoch when the RunState is created.
+  int64 update_time = 4;
 }

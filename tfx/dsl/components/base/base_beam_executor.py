@@ -14,19 +14,21 @@
 """Abstract TFX executor class for Beam powered components."""
 
 import sys
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Union
 
 from absl import flags
 from absl import logging
 from tfx.dsl.components.base.base_executor import BaseExecutor
+from tfx.dsl.placeholder import placeholder
 from tfx.proto.orchestration import pipeline_pb2
+from tfx.utils import name_utils
 from tfx.utils import telemetry_utils
 from tfx.utils import dependency_utils
 
 try:
-  import apache_beam as beam  # pylint: disable=g-import-not-at-top
+  import apache_beam as beam  # pytype: disable=import-error  # pylint: disable=g-import-not-at-top
   _BeamPipeline = beam.Pipeline
-except ModuleNotFoundError:
+except Exception:  # pylint: disable=broad-exception-caught
   beam = None
   _BeamPipeline = Any
 
@@ -39,7 +41,8 @@ class BaseBeamExecutor(BaseExecutor):
 
     def __init__(
         self,
-        beam_pipeline_args: Optional[List[str]] = None,
+        beam_pipeline_args: Optional[List[Union[
+            str, placeholder.Placeholder]]] = None,
         extra_flags: Optional[List[str]] = None,
         tmp_dir: Optional[str] = None,
         unique_id: Optional[str] = None,
@@ -65,11 +68,11 @@ class BaseBeamExecutor(BaseExecutor):
     """Constructs a beam based executor."""
     super().__init__(context)
 
-    self._beam_pipeline_args = None
+    self._beam_pipeline_args = []
     self._make_beam_pipeline_fn = None
     if context:
       if isinstance(context, BaseBeamExecutor.Context):
-        self._beam_pipeline_args = context.beam_pipeline_args
+        self._beam_pipeline_args = context.beam_pipeline_args or []
         self._make_beam_pipeline_fn = context.make_beam_pipeline_fn
       else:
         raise ValueError('BaseBeamExecutor found initialized with '
@@ -79,8 +82,7 @@ class BaseBeamExecutor(BaseExecutor):
     if self._beam_pipeline_args:
       self._beam_pipeline_args = dependency_utils.make_beam_dependency_flags(
           self._beam_pipeline_args)
-      executor_class_path = '%s.%s' % (self.__class__.__module__,
-                                       self.__class__.__name__)
+      executor_class_path = name_utils.get_full_name(self.__class__)
       # TODO(zhitaoli): Rethink how we can add labels and only normalize them
       # if the job is submitted against GCP.
       with telemetry_utils.scoped_labels(
@@ -106,8 +108,10 @@ class BaseBeamExecutor(BaseExecutor):
     # TODO(b/159468583): Obivate this code block by moving the warning to Beam.
     #
     # pylint: disable=g-import-not-at-top
+    # pytype: disable=import-error
     from apache_beam.options.pipeline_options import DirectOptions
     from apache_beam.options.pipeline_options import PipelineOptions
+    # pytype: enable=import-error
     options = PipelineOptions(self._beam_pipeline_args)
     direct_running_mode = options.view_as(DirectOptions).direct_running_mode
     direct_num_workers = options.view_as(DirectOptions).direct_num_workers

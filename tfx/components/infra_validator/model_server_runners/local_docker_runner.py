@@ -15,7 +15,7 @@
 
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from absl import logging
 import docker
@@ -44,8 +44,16 @@ def _find_host_port(ports: Dict[str, Any], container_port: int) -> str:
 
   `ports` is a nested dictionary of the following structure:
 
-  {'8500/tcp': [{'HostIp': '0.0.0.0', 'HostPort': '32769'}],
-   '8501/tcp': [{'HostIp': '0.0.0.0', 'HostPort': '32768'}]}
+  {
+      '8500/tcp': [
+          {'HostIp': '0.0.0.0', 'HostPort': '32769'},
+          {'HostIp': '::', 'HostPort': '32770'},
+      ],
+      '8501/tcp': [
+          {'HostIp': '0.0.0.0', 'HostPort': '32768'},
+          {'HostIp': '::', 'HostPort': '32771'},
+      ],
+  }
 
   Args:
     ports: Dictionary of docker container port mapping.
@@ -57,9 +65,10 @@ def _find_host_port(ports: Dict[str, Any], container_port: int) -> str:
   Raises:
     ValueError: No corresponding host port was found.
   """
-  mappings = ports.get('{}/tcp'.format(container_port))
-  if mappings:
-    return mappings[0].get('HostPort')
+  mappings = ports.get('{}/tcp'.format(container_port), [])
+  for mapping in mappings:
+    if mapping['HostIp'] == '0.0.0.0':
+      return mapping['HostPort']
   else:
     raise ValueError(
         'No HostPort found for ContainerPort={} (all port mappings: {})'
@@ -125,12 +134,12 @@ class LocalDockerRunner(base_runner.BaseModelServerRunner):
         # retrieve the latest container status from docker engine.
         self._container.reload()
         status = self._container.status
-      except docker_errors.NotFound:
+      except docker_errors.NotFound as e:
         # If the job has been aborted and container has specified auto_removal
         # to True, we might get a NotFound error during container.reload().
         raise error_types.JobAborted(
             'Container not found. Possibly removed after the job has been '
-            'aborted.')
+            'aborted.') from e
       # The container is just created and not yet in the running status.
       if status == 'created':
         time.sleep(_POLLING_INTERVAL_SEC)
@@ -139,7 +148,12 @@ class LocalDockerRunner(base_runner.BaseModelServerRunner):
       if status == 'running':
         host_port = _find_host_port(self._container.ports,
                                     self._serving_binary.container_port)
-        self._endpoint = 'localhost:{}'.format(host_port)
+        host_ip_address = (
+            self._serving_spec.local_docker.host_ip_address
+            if self._serving_spec.local_docker.host_ip_address
+            else 'localhost'
+        )
+        self._endpoint = f'{host_ip_address}:{host_port}'
         return
       # Docker status is one of {'created', 'restarting', 'running', 'removing',
       # 'paused', 'exited', or 'dead'}. Status other than 'created' and
@@ -149,6 +163,17 @@ class LocalDockerRunner(base_runner.BaseModelServerRunner):
 
     raise error_types.DeadlineExceeded(
         'Deadline exceeded while waiting for the container to be running.')
+
+  def GetLogs(self) -> Optional[str]:
+    if self._container:
+      result = self._container.logs()
+      if isinstance(result, bytes):
+        return result.decode('utf-8')
+      elif isinstance(result, str):
+        return result
+      else:  # Generator of strs:
+        return '\n'.join(result)
+    return None
 
   def Stop(self):
     if self._container:

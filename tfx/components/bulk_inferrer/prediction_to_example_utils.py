@@ -22,7 +22,6 @@ from tfx.proto import bulk_inferrer_pb2
 from tensorflow_serving.apis import classification_pb2
 from tensorflow_serving.apis import prediction_log_pb2
 
-INPUT_KEY = 'examples'
 _FeatureListType = List[Tuple[str, List[Union[str, bytes, float]]]]
 
 # Typehint Any is for compatibility reason.
@@ -143,7 +142,7 @@ def _parse_predict_log(
     predict_output_spec: _PredictOutputType
 ) -> Tuple[tf.train.Example, _FeatureListType]:
   """Parses PredictLog."""
-  input_tensor_proto = predict_log.request.inputs[INPUT_KEY]
+  _, input_tensor_proto = next(iter(predict_log.request.inputs.items()))
   example = tf.train.Example.FromString(input_tensor_proto.string_val[0])
   outputs = predict_log.response.outputs
   output_features = []
@@ -159,7 +158,7 @@ def _parse_predict_log(
       output_values = output_values.tolist()
     else:  # output_values.ndim == 0
       # Get a scalar for output_values.
-      output_values = [np.asscalar(output_values)]
+      output_values = [output_values.item()]
     output_features.append((col.output_column, output_values))
   return example, output_features
 
@@ -171,13 +170,15 @@ def _add_columns(example: tf.train.Example,
   for col, value in features:
     assert col not in feature_map, ('column name %s already exists in example: '
                                     '%s') % (col, example)
-    # Note: we only consider two types, bytes and float for now.
+    # Note: we only consider three types, bytes, int64 and float for now.
     if isinstance(value[0], (str, bytes)):
       if isinstance(value[0], str):
         bytes_value = [v.encode('utf-8') for v in value]
       else:
         bytes_value = value
       feature_map[col].bytes_list.value[:] = bytes_value
+    elif isinstance(value[0], int):
+      feature_map[col].int64_list.value[:] = value
     else:
       feature_map[col].float_list.value[:] = value
   return example

@@ -12,20 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Tests for tfx.orchestration.portable.output_utils."""
+
 import os
 from unittest import mock
 
 from absl.testing import parameterized
-import tensorflow as tf
 from tfx.dsl.io import fileio
+from tfx.orchestration import data_types_utils
+from tfx.orchestration.portable import data_types
 from tfx.orchestration.portable import outputs_utils
 from tfx.proto.orchestration import execution_result_pb2
 from tfx.proto.orchestration import pipeline_pb2
+from tfx.types import artifact as tfx_artifact
 from tfx.types import standard_artifacts
 from tfx.types.value_artifact import ValueArtifact
 from tfx.utils import test_case_utils
 
 from google.protobuf import text_format
+from ml_metadata.proto import metadata_store_pb2
 
 _PIPELINE_INFO = text_format.Parse("""
   id: "test_pipeline"
@@ -56,6 +60,10 @@ _PIPELINE_NODE = text_format.Parse(
               key: "float_prop"
               value: DOUBLE
             }
+            properties {
+              key: "proto_prop"
+              value: PROTO
+            }
           }
           additional_properties {
             key: "int_prop"
@@ -78,6 +86,17 @@ _PIPELINE_NODE = text_format.Parse(
             value {
               field_value {
                 double_value: 0.5
+              }
+            }
+          }
+          additional_properties {
+            key: "proto_prop"
+            value {
+              field_value {
+                proto_value {
+                  type_url: "type.googleapis.com/google.protobuf.Value"
+                  value: "\\032\\003aaa"
+                }
               }
             }
           }
@@ -105,6 +124,17 @@ _PIPELINE_NODE = text_format.Parse(
               }
             }
           }
+          additional_custom_properties {
+            key: "proto_custom_prop"
+            value {
+              field_value {
+                proto_value {
+                  type_url: "type.googleapis.com/google.protobuf.Value"
+                  value: "\\032\\003bbb"
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -119,7 +149,7 @@ _PIPELINE_NODE = text_format.Parse(
         }
       }
     }
-   outputs {
+    outputs {
       key: "output_3"
       value {
         artifact_spec {
@@ -130,7 +160,55 @@ _PIPELINE_NODE = text_format.Parse(
         }
       }
     }
-  }
+    outputs {
+      key: "output_4"
+      value {
+        artifact_spec {
+          type {
+            id: 4
+            name: "Integer_Metrics"
+          }
+        }
+      }
+    }
+    outputs {
+      key: "output_5"
+      value {
+        artifact_spec {
+          type {
+            id: 5
+            name: "External_Artifact"
+          }
+          external_artifact_uris: "/external_directory_1/123"
+          external_artifact_uris: "/external_directory_2/456"
+        }
+      }
+    }
+    outputs {
+      key: "output_6"
+      value {
+        artifact_spec {
+          type {
+            id: 6
+            name: "String"
+          }
+          external_artifact_uris: "/external_directory_3/789"
+        }
+      }
+    }
+    outputs {
+      key: "output_7"
+      value {
+        artifact_spec {
+          type {
+            id: 7
+            name: "String"
+          }
+          external_artifact_uris: "{resolved_at_runtime}"
+        }
+      }
+    }
+ }
 """, pipeline_pb2.PipelineNode())
 
 
@@ -143,6 +221,20 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
     pipeline_runtime_spec.pipeline_run_id.field_value.string_value = (
         'test_run_0')
     self._pipeline_runtime_spec = pipeline_runtime_spec
+    self._pipeline_root = self.tmp_dir
+    self._mocked_stateful_working_index = 'mocked-index-123'
+    self._dummy_execution = metadata_store_pb2.Execution(
+        id=1,
+        type_id=1,
+        name='dummy_execution',
+        last_known_state=metadata_store_pb2.Execution.State.RUNNING,
+    )
+    data_types_utils.set_metadata_value(
+        self._dummy_execution.custom_properties[
+            outputs_utils._STATEFUL_WORKING_DIR_INDEX
+        ],
+        self._mocked_stateful_working_index,
+    )
 
   def _output_resolver(self, execution_mode=pipeline_pb2.Pipeline.SYNC):
     return outputs_utils.OutputsResolver(
@@ -151,22 +243,34 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
         pipeline_runtime_spec=self._pipeline_runtime_spec,
         execution_mode=execution_mode)
 
+  def _get_external_uri_for_test(self, uri):
+    return os.path.join(self._pipeline_root, os.path.relpath(uri, '/'))
+
   @parameterized.parameters(
-      (pipeline_pb2.Pipeline.SYNC, 'test_pipeline:test_run_0:test_node'),
-      (pipeline_pb2.Pipeline.ASYNC, 'test_pipeline:test_node'))
+      (pipeline_pb2.Pipeline.SYNC, 'test_pipeline:test_run_0:test_node:1'),
+      (pipeline_pb2.Pipeline.ASYNC, 'test_pipeline:test_node:1'))
   def testGenerateOutputArtifacts(self, exec_mode, artifact_name_prefix):
     output_artifacts = self._output_resolver(
         exec_mode).generate_output_artifacts(1)
     self.assertIn('output_1', output_artifacts)
     self.assertIn('output_2', output_artifacts)
     self.assertIn('output_3', output_artifacts)
+    self.assertIn('output_4', output_artifacts)
+    self.assertIn('output_5', output_artifacts)
+    self.assertIn('output_6', output_artifacts)
+    self.assertIn('output_7', output_artifacts)
     self.assertLen(output_artifacts['output_1'], 1)
     self.assertLen(output_artifacts['output_2'], 1)
     self.assertLen(output_artifacts['output_3'], 1)
+    self.assertLen(output_artifacts['output_4'], 1)
+    # If there are multiple external_artifact_uris,
+    # it has to make multiple artifacts of the same number.
+    self.assertLen(output_artifacts['output_5'], 2)
+    self.assertLen(output_artifacts['output_6'], 1)
+    self.assertLen(output_artifacts['output_7'], 1)
 
     artifact_1 = output_artifacts['output_1'][0]
     self.assertRegex(artifact_1.uri, '.*/test_node/output_1/1')
-    self.assertRegex(artifact_1.name, artifact_name_prefix + ':output_1:0')
     self.assertProtoEquals(
         """
         id: 1
@@ -183,38 +287,77 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
           key: "float_prop"
           value: DOUBLE
         }
+        properties {
+          key: "proto_prop"
+          value: PROTO
+        }
         """, artifact_1.artifact_type)
-    self.assertLen(artifact_1.mlmd_artifact.properties, 3)
-    # `name` is already a custom property of the artifact and 3 will be added.
+    self.assertLen(artifact_1.mlmd_artifact.properties, 4)
     self.assertLen(artifact_1.mlmd_artifact.custom_properties, 4)
     self.assertEqual(artifact_1.int_prop, 42)
     self.assertEqual(artifact_1.float_prop, 0.5)
     self.assertEqual(artifact_1.string_prop, 'foo')
+    self.assertEqual(artifact_1.proto_prop.string_value, 'aaa')
     self.assertEqual(artifact_1.get_int_custom_property('int_custom_prop'), 21)
     self.assertEqual(
         artifact_1.get_string_custom_property('string_custom_prop'), 'bar')
     self.assertEqual(
         artifact_1.get_float_custom_property('float_custom_prop'), 0.25)
+    self.assertEqual(
+        artifact_1.get_proto_custom_property('proto_custom_prop').string_value,
+        'bbb')
 
     artifact_2 = output_artifacts['output_2'][0]
     self.assertRegex(artifact_2.uri, '.*/test_node/output_2/1')
-    self.assertRegex(artifact_2.name, artifact_name_prefix + ':output_2:0')
     self.assertProtoEquals(
         """
         id: 2
         name: "test_type_2"
         """, artifact_2.artifact_type)
     self.assertEmpty(artifact_2.mlmd_artifact.properties)
-    # `name` custom property is automatically generated.
-    self.assertLen(artifact_2.mlmd_artifact.custom_properties, 1)
+    self.assertEmpty(artifact_2.mlmd_artifact.custom_properties)
 
     artifact_3 = output_artifacts['output_3'][0]
     self.assertRegex(artifact_3.uri, '.*/test_node/output_3/1/value')
-    self.assertRegex(artifact_3.name, artifact_name_prefix + ':output_3:0')
     self.assertProtoEquals("""
         id: 3
         name: "String"
         """, artifact_3.artifact_type)
+
+    artifact_4 = output_artifacts['output_4'][0]
+    self.assertRegex(artifact_4.uri, '.*/test_node/output_4/1/value')
+    self.assertProtoEquals("""
+        id: 4
+        name: "Integer_Metrics"
+        """, artifact_4.artifact_type)
+
+    artifact_5_0 = output_artifacts['output_5'][0]
+    self.assertEqual(artifact_5_0.uri, '/external_directory_1/123')
+    self.assertTrue(artifact_5_0.is_external)
+
+    artifact_5_1 = output_artifacts['output_5'][1]
+    self.assertEqual(artifact_5_1.uri, '/external_directory_2/456')
+    self.assertTrue(artifact_5_1.is_external)
+
+    artifact_6 = output_artifacts['output_6'][0]
+    self.assertEqual(artifact_6.uri, '/external_directory_3/789')
+    self.assertTrue(artifact_6.is_external)
+
+    artifact_7 = output_artifacts['output_7'][0]
+    self.assertEqual(artifact_7.uri, outputs_utils.RESOLVED_AT_RUNTIME)
+    self.assertTrue(artifact_7.is_external)
+
+  def testGetExecutorOutputDir(self):
+    execution_info = data_types.ExecutionInfo(
+        execution_output_uri=self._output_resolver().get_executor_output_uri(1)
+    )
+    executor_output_dir = outputs_utils.get_executor_output_dir(execution_info)
+
+    self.assertRegex(
+        executor_output_dir, '.*/test_node/.system/executor_execution/1$'
+    )
+
+    self.assertTrue(fileio.isdir(executor_output_dir))
 
   def testGetExecutorOutputUri(self):
     executor_output_uri = self._output_resolver().get_executor_output_uri(1)
@@ -228,25 +371,15 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
 
   def testGetStatefulWorkingDir(self):
     stateful_working_dir = (
-        self._output_resolver().get_stateful_working_directory())
-    self.assertRegex(stateful_working_dir,
-                     '.*/test_node/.system/stateful_working_dir/test_run_0')
+        self._output_resolver().get_stateful_working_directory(
+            self._dummy_execution
+        )
+    )
+    self.assertRegex(
+        stateful_working_dir,
+        f'.*/test_node/.system/stateful_working_dir/{self._mocked_stateful_working_index}',
+    )
     self.assertTrue(fileio.exists(stateful_working_dir))
-
-  @parameterized.parameters(pipeline_pb2.Pipeline.SYNC,
-                            pipeline_pb2.Pipeline.ASYNC)
-  def testGetStatefulWorkingDirWithExecutionId(self, exec_mode):
-    stateful_working_dir = (
-        self._output_resolver(exec_mode).get_stateful_working_directory(1))
-    self.assertRegex(stateful_working_dir,
-                     '.*/test_node/.system/stateful_working_dir/1')
-    fileio.exists(stateful_working_dir)
-
-  def testGetStatefulWorkingDirAsyncRaisesWithoutExecutionId(self):
-    with self.assertRaisesRegex(ValueError,
-                                'Cannot create stateful working dir'):
-      self._output_resolver(
-          pipeline_pb2.Pipeline.ASYNC).get_stateful_working_directory()
 
   def testGetTmpDir(self):
     tmp_dir = self._output_resolver().make_tmp_dir(1)
@@ -259,6 +392,8 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
     outputs_utils.make_output_dirs(output_artifacts)
     for _, artifact_list in output_artifacts.items():
       for artifact in artifact_list:
+        if artifact.is_external:
+          continue
         if isinstance(artifact, ValueArtifact):
           self.assertFalse(fileio.isdir(artifact.uri))
         else:
@@ -267,15 +402,11 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
             f.write('')
         self.assertTrue(fileio.exists(artifact.uri))
 
-    outputs_utils.clear_output_dirs(output_artifacts)
-    for _, artifact_list in output_artifacts.items():
-      for artifact in artifact_list:
-        if not isinstance(artifact, ValueArtifact):
-          self.assertEqual(fileio.listdir(artifact.uri), [])
-
     outputs_utils.remove_output_dirs(output_artifacts)
     for _, artifact_list in output_artifacts.items():
       for artifact in artifact_list:
+        if artifact.is_external:
+          continue
         self.assertFalse(fileio.exists(artifact.uri))
 
   def testMakeOutputDirsArtifactAlreadyExists(self):
@@ -283,6 +414,8 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
     outputs_utils.make_output_dirs(output_artifacts)
     for _, artifact_list in output_artifacts.items():
       for artifact in artifact_list:
+        if artifact.is_external:
+          continue
         if isinstance(artifact, ValueArtifact):
           with fileio.open(artifact.uri, 'w') as f:
             f.write('test')
@@ -292,6 +425,8 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
     outputs_utils.make_output_dirs(output_artifacts)
     for _, artifact_list in output_artifacts.items():
       for artifact in artifact_list:
+        if artifact.is_external:
+          continue
         if isinstance(artifact, ValueArtifact):
           with fileio.open(artifact.uri, 'r') as f:
             self.assertEqual(f.read(), 'test')
@@ -299,9 +434,46 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
           with fileio.open(os.path.join(artifact.uri, 'output'), 'r') as f:
             self.assertEqual(f.read(), 'test')
 
+  def testOmitLifeCycleManagementForExternalArtifact(self):
+    """Test that it omits lifecycle management for external artifacts."""
+    external_artifacts = self._output_resolver().generate_output_artifacts(1)
+    for key, artifact_list in external_artifacts.items():
+      external_artifacts[key] = [
+          artifact for artifact in artifact_list if artifact.is_external
+      ]
+      for artifact in external_artifacts[key]:
+        artifact.uri = self._get_external_uri_for_test(artifact.uri)
+
+    outputs_utils.make_output_dirs(external_artifacts)
+    for _, artifact_list in external_artifacts.items():
+      for artifact in artifact_list:
+        # make_output_dirs method doesn't affect the external uris.
+        self.assertFalse(fileio.exists(artifact.uri))
+
+        # Make new directory and file for next test.
+        if isinstance(artifact, ValueArtifact):
+          artifact_dir = os.path.dirname(artifact.uri)
+          fileio.makedirs(artifact_dir)
+          with fileio.open(artifact.uri, 'w') as f:
+            f.write('test')
+        else:
+          fileio.makedirs(artifact.uri)
+          with fileio.open(os.path.join(artifact.uri, 'output'),
+                           'w') as f:
+            f.write('test')
+
+    outputs_utils.remove_output_dirs(external_artifacts)
+    for _, artifact_list in external_artifacts.items():
+      for artifact in artifact_list:
+        # remove_output_dirs method doesn't affect the external uris.
+        self.assertTrue(fileio.exists(artifact.uri))
+
   def testRemoveStatefulWorkingDirSucceeded(self):
     stateful_working_dir = (
-        self._output_resolver().get_stateful_working_directory())
+        self._output_resolver().get_stateful_working_directory(
+            self._dummy_execution
+        )
+    )
     self.assertTrue(fileio.exists(stateful_working_dir))
 
     outputs_utils.remove_stateful_working_dir(stateful_working_dir)
@@ -309,13 +481,16 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
 
   def testRemoveStatefulWorkingDirNotFoundError(self):
     # removing a nonexisting path is an noop
-    outputs_utils.remove_stateful_working_dir('/a/not/exist/path')
+    outputs_utils.remove_stateful_working_dir(
+        '/a/not/exist/path/.system/stateful_working_dir/123'
+    )
 
   @mock.patch.object(fileio, 'rmtree')
   def testRemoveStatefulWorkingDirOtherError(self, rmtree_fn):
     rmtree_fn.side_effect = ValueError('oops')
     with self.assertRaisesRegex(ValueError, 'oops'):
-      outputs_utils.remove_stateful_working_dir('/a/fake/path')
+      outputs_utils.remove_stateful_working_dir(
+          '/a/not/exist/path/.system/stateful_working_dir/123')
 
   def testPopulateOutputArtifact(self):
     executor_output = execution_result_pb2.ExecutorOutput()
@@ -352,5 +527,52 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
         }
         """, executor_output)
 
-if __name__ == '__main__':
-  tf.test.main()
+  def testGetOrchestratorGeneratedBclDir(self):
+    expected_bcl_dir = os.path.join(
+        self.tmp_dir, 'test_node/.system/orchestrator_generated_bcl'
+    )
+    self.assertFalse(fileio.exists(expected_bcl_dir))
+    actual_bcl_dir = outputs_utils.get_orchestrator_generated_bcl_dir(
+        self._pipeline_runtime_spec, _PIPELINE_NODE.node_info.id
+    )
+    self.assertEqual(actual_bcl_dir, expected_bcl_dir)
+    self.assertTrue(fileio.exists(actual_bcl_dir))
+
+  def testIntermediateArtifactState(self):
+    pipeline_node = text_format.Parse(
+        """
+    node_info {
+      id: "test_node"
+    }
+    outputs {
+      outputs {
+        key: "checkpoint_model"
+        value {
+          artifact_spec {
+            type {
+              id: 1
+              name: "CheckpointModel"
+            }
+            is_async: True
+          }
+        }
+      }
+  }
+  """,
+        pipeline_pb2.PipelineNode(),
+    )
+
+    outputs_resolver = outputs_utils.OutputsResolver(
+        pipeline_node=pipeline_node,
+        pipeline_info=_PIPELINE_INFO,
+        pipeline_runtime_spec=self._pipeline_runtime_spec,
+    )
+    artifacts = outputs_resolver.generate_output_artifacts(1)
+
+    self.assertLen(artifacts, 1)
+    self.assertIn('checkpoint_model', artifacts)
+    self.assertLen(artifacts['checkpoint_model'], 1)
+    self.assertEqual(
+        artifacts['checkpoint_model'][0].state,
+        tfx_artifact.ArtifactState.REFERENCE,
+    )

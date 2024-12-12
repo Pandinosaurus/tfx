@@ -156,14 +156,12 @@ def _build_keras_model(feature_list: List[str]) -> tf.keras.Model:
   d = keras.layers.concatenate(inputs)
   for _ in range(constants.NUM_LAYERS):
     d = keras.layers.Dense(constants.HIDDEN_LAYER_UNITS, activation='relu')(d)
-  outputs = keras.layers.Dense(
-      constants.OUTPUT_LAYER_UNITS, activation='softmax')(
-          d)
+  outputs = keras.layers.Dense(constants.OUTPUT_LAYER_UNITS)(d)
 
   model = keras.Model(inputs=inputs, outputs=outputs)
   model.compile(
       optimizer=keras.optimizers.Adam(constants.LEARNING_RATE),
-      loss='sparse_categorical_crossentropy',
+      loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
       metrics=[keras.metrics.SparseCategoricalAccuracy()])
 
   model.summary(print_fn=logging.info)
@@ -214,7 +212,7 @@ def run_fn(fn_args: tfx.components.FnArgs):
 
   # Write logs to path
   tensorboard_callback = tf.keras.callbacks.TensorBoard(
-      log_dir=fn_args.model_run_dir, update_freq='batch')
+      log_dir=fn_args.model_run_dir, update_freq='epoch')
 
   model.fit(
       train_dataset,

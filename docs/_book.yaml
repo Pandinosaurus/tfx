@@ -17,6 +17,10 @@ upper_tabs:
     - name: "Guide"
       contents:
       - include: /tfx/guide/_toc.yaml
+    - name: "TFX-Addons"
+      contents:
+      - title: TFX-Addons
+        path: /tfx/addons
     - name: API
       skip_translation: true
       contents:
@@ -45,6 +49,8 @@ upper_tabs:
         - include: /tfx/serving/api_docs/cc/_doxygen.yaml
       - heading: ML Metadata
       - include: /tfx/ml_metadata/api_docs/python/mlmd/_toc.yaml
+      - heading: TF Metadata
+      - include: /tfx/tf_metadata/api_docs/python/tfmd/proto/_toc.yaml
       - heading: tfx_bsl
       - include: /tfx/tfx_bsl/api_docs/python/tfx_bsl/public/_toc.yaml
 

@@ -47,11 +47,11 @@ _KFP_POD_NAME_PROPERTY_KEY = 'kfp_pod_name'
 
 
 def _register_execution(
-    metadata_handler: metadata.Metadata,
+    metadata_handle: metadata.Metadata,
     execution_type: metadata_store_pb2.ExecutionType,
     contexts: List[metadata_store_pb2.Context],
     input_artifacts: MutableMapping[str, Sequence[types.Artifact]],
-    exec_properties: Mapping[str, types.Property]
+    exec_properties: Mapping[str, types.Property],
 ) -> metadata_store_pb2.Execution:
   """Registers an execution in MLMD."""
   kfp_pod_name = os.environ.get(_KFP_POD_NAME_ENV_KEY)
@@ -62,11 +62,12 @@ def _register_execution(
     logging.info('Adding KFP pod name %s to execution', kfp_pod_name)
     execution_properties_copy[_KFP_POD_NAME_PROPERTY_KEY] = kfp_pod_name
   return execution_publish_utils.register_execution(
-      metadata_handler=metadata_handler,
+      metadata_handle=metadata_handle,
       execution_type=execution_type,
       contexts=contexts,
       input_artifacts=input_artifacts,
-      exec_properties=execution_properties_copy)
+      exec_properties=execution_properties_copy,
+  )
 
 
 def _get_config_value(config_value: kubeflow_pb2.ConfigValue) -> Optional[str]:
@@ -279,9 +280,11 @@ def _dump_ui_metadata(
           _render_artifact_as_mdstr(single_artifact)
           for single_artifact in name_to_artifacts.get(name, [])
       ])
-      # There must be at least a channel in a input, and all channels in a input
-      # share the same artifact type.
-      artifact_type = spec.channels[0].artifact_query.type.name
+      # TODO(b/255869994): Use InputSpec.artifact_type field instead.
+      if spec.channels:
+        artifact_type = spec.channels[0].artifact_query.type.name
+      else:
+        artifact_type = '_Unknown_'
       rendered_list.append(
           '## {name}\n\n**Type**: {channel_type}\n\n{artifacts}'.format(
               name=_sanitize_underscore(name),

@@ -13,6 +13,7 @@
 # limitations under the License.
 """TFX bulk_inferrer executor."""
 
+import importlib
 import os
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -37,10 +38,13 @@ from tfx_bsl.tfxio import record_based_tfxio
 
 from tensorflow_serving.apis import prediction_log_pb2
 
-try:
-  import tensorflow_text as _  # pylint: disable=g-import-not-at-top
-except ImportError as e:
-  logging.info('tensorflow_text is not available: %s', e)
+
+# Workarounds for importing extra dependencies. Do not add more.
+for name in ['tensorflow_text', 'tensorflow_recommenders']:
+  try:
+    importlib.import_module(name)
+  except ImportError:
+    logging.info('%s is not available.', name)
 
 
 _PREDICTION_LOGS_FILE_NAME = 'prediction_logs'
@@ -255,7 +259,6 @@ def _RunInference(
 
 @beam.ptransform_fn
 @beam.typehints.with_input_types(prediction_log_pb2.PredictionLog)
-@beam.typehints.with_output_types(beam.pvalue.PDone)
 def _WriteExamples(prediction_log: beam.pvalue.PCollection,
                    output_example_spec: bulk_inferrer_pb2.OutputExampleSpec,
                    output_path: str) -> beam.pvalue.PDone:

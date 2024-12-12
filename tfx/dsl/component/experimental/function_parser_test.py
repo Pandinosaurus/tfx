@@ -13,16 +13,17 @@
 # limitations under the License.
 """Tests for tfx.dsl.components.base.function_parser."""
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional, TypedDict, Union
 
+import apache_beam as beam
 import tensorflow as tf
-
+from tfx.dsl.component.experimental.annotations import BeamComponentParameter
 from tfx.dsl.component.experimental.annotations import InputArtifact
 from tfx.dsl.component.experimental.annotations import OutputArtifact
 from tfx.dsl.component.experimental.annotations import OutputDict
 from tfx.dsl.component.experimental.annotations import Parameter
-from tfx.dsl.component.experimental.function_parser import ArgFormats
 from tfx.dsl.component.experimental.function_parser import parse_typehint_component_function
+from tfx.dsl.component.experimental.utils import ArgFormats
 from tfx.types import standard_artifacts
 
 
@@ -30,24 +31,36 @@ class FunctionParserTest(tf.test.TestCase):
 
   def testSimpleFunctionParse(self):
 
-    def func_a(a: int, b: int, unused_c: str, unused_d: bytes,
-               unused_e: Parameter[float]) -> OutputDict(c=float):
-      return {'c': float(a + b)}
+    def func_a(
+        a: int,
+        b: int,
+        unused_c: str,
+        unused_d: bytes,
+        unused_e: Dict[str, List[float]],
+        unused_f: Parameter[float],
+        unused_g: BeamComponentParameter[beam.Pipeline] = None
+    ) -> OutputDict(
+        c=float, d=Dict[str, List[float]]):
+      return {'c': float(a + b), 'd': unused_e}
 
-    inputs, outputs, parameters, arg_formats, arg_defaults, returned_values = (
-        parse_typehint_component_function(func_a))
+    (inputs, outputs, parameters, arg_formats, arg_defaults, returned_values,
+     json_typehints, return_json_typehints) = (
+         parse_typehint_component_function(func_a))
     self.assertDictEqual(
         inputs, {
             'a': standard_artifacts.Integer,
             'b': standard_artifacts.Integer,
             'unused_c': standard_artifacts.String,
             'unused_d': standard_artifacts.Bytes,
+            'unused_e': standard_artifacts.JsonValue,
         })
     self.assertDictEqual(outputs, {
         'c': standard_artifacts.Float,
+        'd': standard_artifacts.JsonValue,
     })
     self.assertDictEqual(parameters, {
-        'unused_e': float,
+        'unused_f': float,
+        'unused_g': beam.Pipeline,
     })
     self.assertDictEqual(
         arg_formats, {
@@ -55,10 +68,14 @@ class FunctionParserTest(tf.test.TestCase):
             'b': ArgFormats.ARTIFACT_VALUE,
             'unused_c': ArgFormats.ARTIFACT_VALUE,
             'unused_d': ArgFormats.ARTIFACT_VALUE,
-            'unused_e': ArgFormats.PARAMETER,
+            'unused_e': ArgFormats.ARTIFACT_VALUE,
+            'unused_f': ArgFormats.PARAMETER,
+            'unused_g': ArgFormats.BEAM_PARAMETER,
         })
-    self.assertDictEqual(arg_defaults, {})
-    self.assertEqual(returned_values, {'c': False})
+    self.assertDictEqual(arg_defaults, {'unused_g': None})
+    self.assertEqual(returned_values, {'c': False, 'd': False})
+    self.assertDictEqual(json_typehints, {'unused_e': Dict[str, List[float]]})
+    self.assertDictEqual(return_json_typehints, {'d': Dict[str, List[float]]})
 
   def testArtifactFunctionParse(self):
 
@@ -67,14 +84,15 @@ class FunctionParserTest(tf.test.TestCase):
         model: OutputArtifact[standard_artifacts.Model],
         schema: InputArtifact[standard_artifacts.Schema],
         statistics: OutputArtifact[standard_artifacts.ExampleStatistics],
-        num_steps: Parameter[int]
+        num_steps: Parameter[int],
+        unused_beam_pipeline: BeamComponentParameter[beam.Pipeline],
     ) -> OutputDict(
         precision=float,
         recall=float,
         message=str,
         serialized_value=bytes,
         is_blessed=bool):
-      del examples, model, schema, statistics, num_steps
+      del examples, model, schema, statistics, num_steps, unused_beam_pipeline
       return {
           'precision': 0.9,
           'recall': 0.8,
@@ -83,8 +101,9 @@ class FunctionParserTest(tf.test.TestCase):
           'is_blessed': False,
       }
 
-    inputs, outputs, parameters, arg_formats, arg_defaults, returned_values = (
-        parse_typehint_component_function(func_a))
+    (inputs, outputs, parameters, arg_formats, arg_defaults, returned_values,
+     json_typehints, return_json_typehints) = (
+         parse_typehint_component_function(func_a))
     self.assertDictEqual(
         inputs, {
             'examples': standard_artifacts.Examples,
@@ -102,6 +121,7 @@ class FunctionParserTest(tf.test.TestCase):
         })
     self.assertDictEqual(parameters, {
         'num_steps': int,
+        'unused_beam_pipeline': beam.Pipeline,
     })
     self.assertDictEqual(
         arg_formats, {
@@ -110,6 +130,7 @@ class FunctionParserTest(tf.test.TestCase):
             'schema': ArgFormats.INPUT_ARTIFACT,
             'statistics': ArgFormats.OUTPUT_ARTIFACT,
             'num_steps': ArgFormats.PARAMETER,
+            'unused_beam_pipeline': ArgFormats.BEAM_PARAMETER,
         })
     self.assertDictEqual(arg_defaults, {})
     self.assertEqual(
@@ -120,26 +141,30 @@ class FunctionParserTest(tf.test.TestCase):
             'serialized_value': False,
             'is_blessed': False,
         })
+    self.assertDictEqual(json_typehints, {})
+    self.assertDictEqual(return_json_typehints, {})
 
   def testEmptyReturnValue(self):
     # No output typehint.
     def func_a(examples: InputArtifact[standard_artifacts.Examples],
                model: OutputArtifact[standard_artifacts.Model], a: int,
                b: float, c: Parameter[int], d: Parameter[str],
-               e: Parameter[bytes]):
-      del examples, model, a, b, c, d, e
+               e: Parameter[bool], f: BeamComponentParameter[beam.Pipeline]):
+      del examples, model, a, b, c, d, e, f
 
     # `None` output typehint.
     def func_b(examples: InputArtifact[standard_artifacts.Examples],
                model: OutputArtifact[standard_artifacts.Model], a: int,
                b: float, c: Parameter[int], d: Parameter[str],
-               e: Parameter[bytes]) -> None:
-      del examples, model, a, b, c, d, e
+               e: Parameter[bool],
+               f: BeamComponentParameter[beam.Pipeline]) -> None:
+      del examples, model, a, b, c, d, e, f
 
     # Both functions should be parsed in the same way.
     for func in [func_a, func_b]:
-      (inputs, outputs, parameters, arg_formats, arg_defaults,
-       returned_values) = parse_typehint_component_function(func)
+      (inputs, outputs, parameters, arg_formats,
+       arg_defaults, returned_values, json_typehints,
+       return_json_typehints) = parse_typehint_component_function(func)
       self.assertDictEqual(
           inputs, {
               'examples': standard_artifacts.Examples,
@@ -152,7 +177,8 @@ class FunctionParserTest(tf.test.TestCase):
       self.assertDictEqual(parameters, {
           'c': int,
           'd': str,
-          'e': bytes,
+          'e': bool,
+          'f': beam.Pipeline,
       })
       self.assertDictEqual(
           arg_formats, {
@@ -163,9 +189,12 @@ class FunctionParserTest(tf.test.TestCase):
               'c': ArgFormats.PARAMETER,
               'd': ArgFormats.PARAMETER,
               'e': ArgFormats.PARAMETER,
+              'f': ArgFormats.BEAM_PARAMETER,
           })
       self.assertDictEqual(arg_defaults, {})
       self.assertEqual(returned_values, {})
+      self.assertDictEqual(json_typehints, {})
+      self.assertDictEqual(return_json_typehints, {})
 
   def testOptionalArguments(self):
     # Various optional argument schemes.
@@ -179,11 +208,15 @@ class FunctionParserTest(tf.test.TestCase):
                h: bool = False,
                i: Parameter[str] = 'default',
                j: Parameter[int] = 999,
-               examples: InputArtifact[standard_artifacts.Examples] = None):
-      del a, b, c, d, e, f, g, h, i, j, examples
+               k: BeamComponentParameter[beam.Pipeline] = None,
+               examples: InputArtifact[standard_artifacts.Examples] = None,
+               optional_json: Optional[Union[List[Dict[str, int]],
+                                             Dict[str, bool]]] = None):
+      del a, b, c, d, e, f, g, h, i, j, k, examples, optional_json
 
-    inputs, outputs, parameters, arg_formats, arg_defaults, returned_values = (
-        parse_typehint_component_function(func_a))
+    (inputs, outputs, parameters, arg_formats, arg_defaults, returned_values,
+     json_typehints, return_json_typehints) = (
+         parse_typehint_component_function(func_a))
     self.assertDictEqual(
         inputs,
         {
@@ -198,12 +231,14 @@ class FunctionParserTest(tf.test.TestCase):
             # 'i' is missing here as it is a parameter.
             # 'j' is missing here as it is a parameter.
             'examples': standard_artifacts.Examples,
+            'optional_json': standard_artifacts.JsonValue,
         })
     self.assertDictEqual(outputs, {})
     self.assertDictEqual(parameters, {
         'c': str,
         'i': str,
         'j': int,
+        'k': beam.Pipeline,
     })
     self.assertDictEqual(
         arg_formats, {
@@ -217,7 +252,9 @@ class FunctionParserTest(tf.test.TestCase):
             'h': ArgFormats.ARTIFACT_VALUE,
             'i': ArgFormats.PARAMETER,
             'j': ArgFormats.PARAMETER,
+            'k': ArgFormats.BEAM_PARAMETER,
             'examples': ArgFormats.INPUT_ARTIFACT,
+            'optional_json': ArgFormats.ARTIFACT_VALUE,
         })
     self.assertDictEqual(
         arg_defaults, {
@@ -228,9 +265,15 @@ class FunctionParserTest(tf.test.TestCase):
             'h': False,
             'i': 'default',
             'j': 999,
+            'k': None,
             'examples': None,
+            'optional_json': None,
         })
     self.assertEqual(returned_values, {})
+    self.assertDictEqual(json_typehints, {
+        'optional_json': Optional[Union[List[Dict[str, int]], Dict[str, bool]]]
+    })
+    self.assertDictEqual(return_json_typehints, {})
 
   def testOptionalReturnValues(self):
 
@@ -240,7 +283,8 @@ class FunctionParserTest(tf.test.TestCase):
         message=str,
         serialized_value=bytes,
         optional_label=Optional[str],
-        optional_metric=Optional[float]):
+        optional_metric=Optional[float],
+        optional_json=Optional[Dict[str, List[bool]]]):
       return {
           'precision': 0.9,
           'recall': 0.8,
@@ -248,10 +292,14 @@ class FunctionParserTest(tf.test.TestCase):
           'serialized_value': b'bar',
           'optional_label': None,
           'optional_metric': 1.0,
+          'optional_json': {
+              'foo': 1
+          },
       }
 
-    inputs, outputs, parameters, arg_formats, arg_defaults, returned_values = (
-        parse_typehint_component_function(func_a))
+    (inputs, outputs, parameters, arg_formats, arg_defaults, returned_values,
+     json_typehints, return_json_typehints) = (
+         parse_typehint_component_function(func_a))
     self.assertDictEqual(inputs, {})
     self.assertDictEqual(
         outputs, {
@@ -261,6 +309,7 @@ class FunctionParserTest(tf.test.TestCase):
             'serialized_value': standard_artifacts.Bytes,
             'optional_label': standard_artifacts.String,
             'optional_metric': standard_artifacts.Float,
+            'optional_json': standard_artifacts.JsonValue,
         })
     self.assertDictEqual(parameters, {})
     self.assertDictEqual(arg_formats, {})
@@ -273,7 +322,39 @@ class FunctionParserTest(tf.test.TestCase):
             'serialized_value': False,
             'optional_label': True,
             'optional_metric': True,
+            'optional_json': True,
         })
+    self.assertDictEqual(json_typehints, {})
+    self.assertDictEqual(return_json_typehints,
+                         {'optional_json': Optional[Dict[str, List[bool]]]})
+
+  def testListOfInputArtifacts(self):
+    def func(
+        examples_list: InputArtifact[List[standard_artifacts.Examples]],
+    ):
+      del examples_list
+    (
+        inputs,
+        outputs,
+        parameters,
+        arg_formats,
+        arg_defaults,
+        returned_values,
+        json_typehints,
+        return_json_typehints,
+    ) = parse_typehint_component_function(func)
+    self.assertDictEqual(
+        inputs,
+        {'examples_list': standard_artifacts.Examples})
+    self.assertEmpty(outputs)
+    self.assertEmpty(parameters)
+    self.assertDictEqual(
+        arg_formats,
+        {'examples_list': ArgFormats.LIST_INPUT_ARTIFACTS})
+    self.assertEmpty(arg_defaults)
+    self.assertEmpty(returned_values)
+    self.assertEmpty(json_typehints)
+    self.assertEmpty(return_json_typehints)
 
   def testFunctionParseErrors(self):
     # Non-function arguments.
@@ -292,8 +373,9 @@ class FunctionParserTest(tf.test.TestCase):
     # Function with *args and **kwargs.
     with self.assertRaisesRegex(
         ValueError,
-        'must have either an OutputDict instance or `None` as its return'):
-
+        'Return type annotation of @component func_a should be TypedDict or'
+        ' None.',
+    ):
       def func_a(a: int, b: int) -> object:
         del a, b
         return object()
@@ -365,16 +447,16 @@ class FunctionParserTest(tf.test.TestCase):
     # Output artifact in the wrong place.
     with self.assertRaisesRegex(
         ValueError,
-        'Output artifacts .* should be declared as function parameters'):
-
+        "output artifact 'c' should be declared as a function parameter",
+    ):
       def func_i(a: int, b: int) -> OutputDict(c=standard_artifacts.Examples):
         return {'c': float(a + b)}
 
       parse_typehint_component_function(func_i)
     with self.assertRaisesRegex(
         ValueError,
-        'Output artifacts .* should be declared as function parameters'):
-
+        "output artifact 'c' should be declared as a function parameter",
+    ):
       def func_j(
           a: int,
           b: int) -> OutputDict(c=OutputArtifact[standard_artifacts.Examples]):
@@ -430,9 +512,9 @@ class FunctionParserTest(tf.test.TestCase):
     # Optional parameter's default value does not match declared type.
     with self.assertRaisesRegex(
         ValueError,
-        'The default value for optional parameter .* on function .* must be an '
-        'instance of its declared type .* or `None`'):
-
+        'The default value for optional parameter .* on function must be an '
+        'instance of its declared type .* or `None`',
+    ):
       def func_n(a: int,
                  b: int,
                  num_iterations: Parameter[int] = 'abc') -> OutputDict(c=float):
@@ -441,6 +523,20 @@ class FunctionParserTest(tf.test.TestCase):
 
       parse_typehint_component_function(func_n)
 
+  def testTypedDictReturnAnnotation(self):
+    class SimpleOutput(TypedDict):
+      x: int
 
-if __name__ == '__main__':
-  tf.test.main()
+    def func() -> SimpleOutput:
+      return {'x': 42}
+
+    parsed = parse_typehint_component_function(func)
+    self.assertEqual(parsed.outputs, {'x': standard_artifacts.Integer})
+
+  def testTypedDictReturnAnnotation_Variant(self):
+
+    def func() -> TypedDict('SimpleOutput', {'x': int}):
+      return {'x': 42}
+
+    parsed = parse_typehint_component_function(func)
+    self.assertEqual(parsed.outputs, {'x': standard_artifacts.Integer})

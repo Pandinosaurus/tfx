@@ -14,7 +14,6 @@
 """Tests for bulk_inferrer."""
 
 import os
-import unittest
 
 import tensorflow as tf
 from tfx.components.bulk_inferrer import executor
@@ -30,8 +29,6 @@ from google.protobuf import text_format
 from tensorflow_serving.apis import prediction_log_pb2
 
 
-@unittest.skipIf(tf.__version__ < '2',
-                 'This test uses testdata only compatible with TF 2.x')
 class ExecutorTest(tf.test.TestCase):
 
   def setUp(self):
@@ -199,7 +196,3 @@ class ExecutorTest(tf.test.TestCase):
     self.assertFalse(
         fileio.exists(
             os.path.join(self._output_examples_dir, 'Split-unlabelled2')))
-
-
-if __name__ == '__main__':
-  tf.test.main()

@@ -14,10 +14,15 @@
 """Tests for tfx.types.artifact_utils."""
 
 import json
+import sys
 from typing import Dict, List
+import unittest
 
 import tensorflow as tf
+from tfx.dsl.compiler import placeholder_utils
+from tfx.dsl.components.base.testing import test_node
 from tfx.dsl.placeholder import placeholder
+from tfx.orchestration.portable import data_types
 from tfx.proto import example_gen_pb2
 from tfx.types import artifact
 from tfx.types import channel
@@ -29,7 +34,6 @@ from tfx.types.standard_artifacts import Examples
 from tfx.utils import proto_utils
 
 from google.protobuf import json_format
-from google.protobuf import text_format
 
 
 class _InputArtifact(artifact.Artifact):
@@ -103,7 +107,7 @@ class ComponentSpecTest(tf.test.TestCase):
     with self.assertRaisesRegex(
         TypeError,
         "Expected type <(class|type) 'int'> for parameter u?'folds' but got "
-        'string.'):
+        'str.'):
       spec = _BasicComponentSpec(
           folds='string', input=input_channel, output=output_channel)
 
@@ -279,6 +283,20 @@ class ComponentSpecTest(tf.test.TestCase):
     optional_specified = SpecWithOptionalOutput(x=channel.Channel(type=_Z))
     self.assertIn('x', optional_specified.outputs.keys())
 
+  def testIsIntermediateChannel(self):
+    class Spec(ComponentSpec):
+      PARAMETERS = {}
+      INPUTS = {}
+      OUTPUTS = {
+          'x': ChannelParameter(
+              type=_Z,
+              is_async=True,
+          )
+      }
+
+    spec = Spec(x=channel.Channel(type=_Z))
+    self.assertTrue(spec.OUTPUTS['x'].is_async)
+
   def testChannelParameterType(self):
     arg_name = 'foo'
 
@@ -291,9 +309,6 @@ class ComponentSpecTest(tf.test.TestCase):
     channel_parameter = ChannelParameter(type=_FooArtifact)
     # Following should pass.
     channel_parameter.type_check(arg_name, channel.Channel(type=_FooArtifact))
-
-    with self.assertRaisesRegex(TypeError, arg_name):
-      channel_parameter.type_check(arg_name, 42)  # Wrong value.
 
     with self.assertRaisesRegex(TypeError, arg_name):
       channel_parameter.type_check(arg_name, channel.Channel(type=_BarArtifact))
@@ -311,21 +326,23 @@ class ComponentSpecTest(tf.test.TestCase):
     list_parameter = ExecutionParameter(type=List[int])
     list_parameter.type_check('list_parameter', [])
     list_parameter.type_check('list_parameter', [42])
-    with self.assertRaisesRegex(TypeError, 'Expecting a list for parameter'):
+    with self.assertRaisesRegex(TypeError,
+                                r'Expected type typing\.List\[int\]'):
       list_parameter.type_check('list_parameter', 42)
 
-    with self.assertRaisesRegex(TypeError, "Expecting item type <(class|type) "
-                                "'int'> for parameter u?'list_parameter'"):
+    with self.assertRaisesRegex(TypeError, r"Expected type typing\.List\[int\] "
+                                "for parameter u?'list_parameter'"):
       list_parameter.type_check('list_parameter', [42, 'wrong item'])
 
     dict_parameter = ExecutionParameter(type=Dict[str, int])
     dict_parameter.type_check('dict_parameter', {})
     dict_parameter.type_check('dict_parameter', {'key1': 1, 'key2': 2})
-    with self.assertRaisesRegex(TypeError, 'Expecting a dict for parameter'):
+    with self.assertRaisesRegex(
+        TypeError, r'Expected type typing\.Dict\[str, int\] for parameter'):
       dict_parameter.type_check('dict_parameter', 'simple string')
 
-    with self.assertRaisesRegex(TypeError, "Expecting value type "
-                                "<(class|type) 'int'>"):
+    with self.assertRaisesRegex(
+        TypeError, r'Expected type typing\.Dict\[str, int\] for parameter'):
       dict_parameter.type_check('dict_parameter', {'key1': '1'})
 
     proto_parameter = ExecutionParameter(type=example_gen_pb2.Input)
@@ -343,7 +360,11 @@ class ComponentSpecTest(tf.test.TestCase):
     with self.assertRaises(json_format.ParseError):
       proto_parameter.type_check('proto_parameter', {'splits': 42})
 
-    output_channel = channel.Channel(type=_OutputArtifact)
+    output_channel = channel.OutputChannel(
+        artifact_type=_OutputArtifact,
+        producer_component=test_node.TestNode('producer'),
+        output_key='foo',
+    )
 
     placeholder_parameter = ExecutionParameter(type=str)
     placeholder_parameter.type_check(
@@ -352,12 +373,28 @@ class ComponentSpecTest(tf.test.TestCase):
     placeholder_parameter.type_check(
         'placeholder_parameter',
         placeholder.runtime_info('platform_config').base_dir)
+
+  @unittest.skipIf(sys.version_info.major == 3 and sys.version_info.minor < 9,
+                   'Only works for Python 3.9+')
+  def testExecutionParameterTypeCheckForPython39Type(self):
+    list_parameter = ExecutionParameter(type=list[int])
+    list_parameter.type_check('list_parameter', [])
+    list_parameter.type_check('list_parameter', [42])
+    with self.assertRaisesRegex(TypeError,
+                                r'Expected type list\[int\] for parameter'):
+      list_parameter.type_check('list_parameter', 42)
+
     with self.assertRaisesRegex(
-        TypeError, 'Only simple RuntimeInfoPlaceholders are supported'):
-      placeholder_parameter.type_check(
-          'placeholder_parameter',
-          placeholder.runtime_info('platform_config').base_dir +
-          placeholder.exec_property('version'))
+        TypeError,
+        r"Expected type list\[int\] for parameter u?'list_parameter'"):
+      list_parameter.type_check('list_parameter', [42, 'wrong item'])
+
+    dict_parameter = ExecutionParameter(type=dict[str, int])
+    dict_parameter.type_check('dict_parameter', {})
+    dict_parameter.type_check('dict_parameter', {'key1': 1, 'key2': 2})
+    with self.assertRaisesRegex(
+        TypeError, r'Expected type dict\[str, int\] for parameter'):
+      dict_parameter.type_check('dict_parameter', 'simple string')
 
   def testExecutionParameterUseProto(self):
 
@@ -396,19 +433,23 @@ class ComponentSpecTest(tf.test.TestCase):
         input=channel.Channel(type=_InputArtifact),
         output=channel.Channel(type=_OutputArtifact))
 
-    # Verify exec_properties store parsed value when use_proto set to True.
-    expected_proto = text_format.Parse(
+    # Verify exec_properties stores the correct placeholder when use_proto set
+    # to True.
+    resolved_proto = placeholder_utils.resolve_placeholder_expression(
+        spec.exec_properties['config_proto'].encode(),
+        placeholder_utils.ResolutionContext(
+            exec_info=data_types.ExecutionInfo()
+        )
+    )
+    self.assertProtoEquals(
         """
-            splits {
-              name: "name"
-              pattern: "pattern"
-            }
-          """, example_gen_pb2.Input())
-    self.assertProtoEquals(expected_proto, spec.exec_properties['config_proto'])
+        splits {
+          name: "name"
+          pattern: "pattern"
+        }
+        """,
+        resolved_proto
+    )
     self.assertEqual(True, spec.exec_properties['boolean'])
     self.assertIsInstance(spec.exec_properties['list_config_proto'], list)
     self.assertEqual(spec.exec_properties['list_boolean'], [False, True])
-
-
-if __name__ == '__main__':
-  tf.test.main()

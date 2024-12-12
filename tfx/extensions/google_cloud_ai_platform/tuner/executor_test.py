@@ -25,6 +25,7 @@ from tfx.extensions.google_cloud_ai_platform.tuner import executor as ai_platfor
 from tfx.proto import tuner_pb2
 from tfx.types import standard_component_specs
 from tfx.utils import json_utils
+from tfx.utils import name_utils
 from tfx.utils import proto_utils
 
 
@@ -52,9 +53,8 @@ class ExecutorTest(tf.test.TestCase):
             },
         },
     }
-    self._executor_class_path = '%s.%s' % (
-        ai_platform_tuner_executor._WorkerExecutor.__module__,
-        ai_platform_tuner_executor._WorkerExecutor.__name__)
+    self._executor_class_path = name_utils.get_full_name(
+        ai_platform_tuner_executor._WorkerExecutor)
 
     self.addCleanup(mock.patch.stopall)
     self.mock_runner = mock.patch(
@@ -89,7 +89,7 @@ class ExecutorTest(tf.test.TestCase):
             'masterType': 'standard',
             'workerType': 'standard',
             'workerCount': 2,
-        }, self._job_id, False, None)
+        }, self._job_id, None, False, None)
 
   def testDoWithTuneArgsAndTrainingInputOverride(self):
     executor = ai_platform_tuner_executor.Executor()
@@ -122,7 +122,10 @@ class ExecutorTest(tf.test.TestCase):
             # Confirm workerCount has been adjusted to num_parallel_trials.
             'workerCount': 5,
         },
-        self._job_id, False, None)
+        self._job_id,
+        None,
+        False,
+        None)
 
   def testDoWithoutCustomCaipTuneArgs(self):
     executor = ai_platform_tuner_executor.Executor()
@@ -146,7 +149,4 @@ class ExecutorTest(tf.test.TestCase):
         self._executor_class_path, {
             'project': self._project_id,
             'jobDir': self._job_dir,
-        }, self._job_id, enable_vertex, vertex_region)
-
-if __name__ == '__main__':
-  tf.test.main()
+        }, self._job_id, None, enable_vertex, vertex_region)

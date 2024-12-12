@@ -1,3 +1,5 @@
+load("//tfx:tfx.bzl", "tfx_py_proto_library")
+
 # Copyright 2020 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,8 +18,6 @@ package(default_visibility = ["//tfx:__subpackages__"])
 licenses(["notice"])  # Apache 2.0
 
 exports_files(["LICENSE"])
-
-load("//tfx:tfx.bzl", "tfx_py_proto_library")
 
 tfx_py_proto_library(
     name = "bulk_inferrer_proto_py_pb2",
@@ -62,4 +62,17 @@ tfx_py_proto_library(
 tfx_py_proto_library(
     name = "tuner_proto_py_pb2",
     srcs = ["tuner.proto"],
+)
+
+tfx_py_proto_library(
+    name = "example_diff_proto_py_pb2",
+    srcs = ["example_diff.proto"],
+)
+
+tfx_py_proto_library(
+    name = "distribution_validator_proto_py_pb2",
+    srcs = ["distribution_validator.proto"],
+    deps = [
+        "@com_github_tf_metadata//tensorflow_metadata/proto/v0:py_metadata_v0_proto_py",
+    ],
 )

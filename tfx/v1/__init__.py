@@ -13,11 +13,21 @@
 # limitations under the License.
 """Public modules for TFX."""
 
-from tfx.v1 import components
+# pylint: disable=g-statement-before-imports,g-import-not-at-top
+
+try:
+  # These modules may not be available in some environments.
+  from tfx.v1 import components
+  from tfx.v1 import extensions
+  from tfx.v1 import orchestration
+except ImportError as e:
+  # 'tfx.v1' is needed for the error during the circular dependency resolution.
+  if e.name not in ['tfx.v1', 'components', 'extensions', 'orchestration']:
+    raise
+
 from tfx.v1 import dsl
-from tfx.v1 import extensions
-from tfx.v1 import orchestration
 from tfx.v1 import proto
+from tfx.v1 import testing
 from tfx.v1 import types
 from tfx.v1 import utils
 

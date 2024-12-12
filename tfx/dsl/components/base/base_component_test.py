@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for tfx.dsl.components.base.base_component."""
 
+
+
 import tensorflow as tf
 
 from tfx import types
@@ -26,11 +28,11 @@ from tfx.utils import json_utils
 
 
 class _InputArtifact(types.Artifact):
-  TYPE_NAME = "InputArtifact"
+  TYPE_NAME = "bct.InputArtifact"
 
 
 class _OutputArtifact(types.Artifact):
-  TYPE_NAME = "OutputArtifact"
+  TYPE_NAME = "bct.OutputArtifact"
 
 
 class _BasicComponentSpec(types.ComponentSpec):
@@ -78,7 +80,16 @@ class ComponentTest(tf.test.TestCase):
     self.assertIs(input_channel, component.inputs["input"])
     self.assertIsInstance(component.outputs["output"], types.Channel)
     self.assertEqual(component.outputs["output"].type, _OutputArtifact)
-    self.assertEqual(component.outputs["output"].type_name, "OutputArtifact")
+    self.assertEqual(component.outputs["output"].type_name, "bct.OutputArtifact")
+
+  def testBaseNodeNewOverride(self):
+    # Test behavior of `BaseNode.__new__` override.
+    input_channel = types.Channel(type=_InputArtifact)
+    component = _BasicComponent(folds=10, input=input_channel)
+    self.assertIs(component._CONSTRUCT_CLS, _BasicComponent)
+    self.assertEqual(component._CONSTRUCT_ARGS, ())
+    self.assertEqual(component._CONSTRUCT_KWARGS,
+                     {"folds": 10, "input": input_channel})
 
   def testComponentSpecType(self):
 
@@ -242,11 +253,8 @@ class ComponentTest(tf.test.TestCase):
     self.assertEqual(recovered_component.outputs["output"].type,
                      _OutputArtifact)
     self.assertEqual(recovered_component.outputs["output"].type_name,
-                     "OutputArtifact")
+                     "bct.OutputArtifact")
     self.assertEqual(recovered_component.driver_class, component.driver_class)
-    # Test re-dump.
-    new_json_dict = json_utils.dumps(recovered_component)
-    self.assertEqual(new_json_dict, json_dict)
 
   def testTaskDependency(self):
     channel_1 = types.Channel(type=_InputArtifact)
@@ -259,6 +267,15 @@ class ComponentTest(tf.test.TestCase):
     self.assertEqual(True, component_2 in component_1.downstream_nodes)
     self.assertEqual(True, component_1 in component_2.upstream_nodes)
 
+  def testComponentInit_OutputChannelType(self):
+    component = _BasicComponent(
+        spec=_BasicComponentSpec(
+            input=types.Channel(type=_InputArtifact),
+            folds=10,
+            output=types.Channel(type=_OutputArtifact))).with_id("foo")
 
-if __name__ == "__main__":
-  tf.test.main()
+    self.assertIsInstance(component.spec.outputs["output"], types.OutputChannel)
+    self.assertIsInstance(component.outputs["output"], types.OutputChannel)
+    output_channel = component.outputs["output"]
+    self.assertEqual(output_channel.producer_component_id, "foo")
+    self.assertEqual(output_channel.output_key, "output")

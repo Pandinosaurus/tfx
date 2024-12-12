@@ -13,16 +13,38 @@
 # limitations under the License.
 """Tests for tfx.orchestration.data_types_utils."""
 
+
+import importlib
+import pytest
 from absl.testing import parameterized
-import tensorflow as tf
+from tfx import types
 from tfx.orchestration import data_types_utils
+from tfx.proto.orchestration import execution_result_pb2
 from tfx.proto.orchestration import pipeline_pb2
 from tfx.types import artifact_utils
+from tfx.utils import proto_utils
 from tfx.utils import test_case_utils
 
+from google.protobuf import struct_pb2
 from google.protobuf import text_format
+
 from ml_metadata.proto import metadata_store_pb2
 from ml_metadata.proto import metadata_store_service_pb2
+
+_DEFAULT_ARTIFACT_TYPE_NAME = 'Examples'
+
+
+@pytest.fixture(scope="module", autouse=True)
+def cleanup():
+  yield
+  importlib.reload(struct_pb2)
+
+
+def _create_artifact(uri: str) -> types.Artifact:
+  artifact = types.Artifact(
+      metadata_store_pb2.ArtifactType(name=_DEFAULT_ARTIFACT_TYPE_NAME))
+  artifact.uri = uri
+  return artifact
 
 
 class DataTypesUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
@@ -89,6 +111,32 @@ class DataTypesUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
       self.assertLen(self.artifact_dict[k], len(v))
       self.assertEqual(self.artifact_dict[k][0].id, v[0].id)
       self.assertEqual(self.artifact_dict[k][0].type_name, v[0].type_name)
+
+  def testUnpackExecutorOutput(self):
+    artifact0 = _create_artifact('uri0').mlmd_artifact
+    artifact1 = _create_artifact('uri1').mlmd_artifact
+    artifact2 = _create_artifact('uri2').mlmd_artifact
+    executor_output_artifacts = {
+        'artifact_key0':
+            execution_result_pb2.ExecutorOutput.ArtifactList(artifacts=[]),
+        'artifact_key1':
+            execution_result_pb2.ExecutorOutput.ArtifactList(artifacts=[
+                artifact0,
+            ]),
+        'artifact_key2':
+            execution_result_pb2.ExecutorOutput.ArtifactList(artifacts=[
+                artifact1,
+                artifact2,
+            ])
+    }
+    expected_output = {
+        'artifact_key0': [],
+        'artifact_key1': [artifact0],
+        'artifact_key2': [artifact1, artifact2],
+    }
+    actual_output = data_types_utils.unpack_executor_output_artifacts(
+        executor_output_artifacts)
+    self.assertEqual(expected_output, actual_output)
 
   def testBuildArtifactStructDict(self):
     actual_artifact_struct_dict = data_types_utils.build_artifact_struct_dict(
@@ -196,6 +244,31 @@ class DataTypesUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
         data_types_utils.get_metadata_value_type(tfx_value),
         metadata_store_pb2.INT)
 
+    tfx_value = pipeline_pb2.Value()
+    text_format.Parse(
+        """
+        field_value {
+          proto_value: {
+            type_url: "type.googleapis.com/ml_metadata.Artifact"
+            value: ":\rartifact_name"
+          }
+        }""", tfx_value)
+    self.assertEqual(
+        data_types_utils.get_metadata_value_type(tfx_value),
+        metadata_store_pb2.PROTO)
+
+  def testGetMetadataValue(self):
+    # Wrap an arbitrary proto message in an MLMD Value.
+    original_proto_value = struct_pb2.Value(string_value='message in a proto')
+    mlmd_value = metadata_store_pb2.Value()
+    mlmd_value.proto_value.Pack(original_proto_value)
+    # Get the raw metadata value, which should be a google.protobuf.Any type
+    # since the property has a proto_value.
+    raw_property_value = data_types_utils.get_metadata_value(mlmd_value)
+    # Unpack the Any protobuf and compare against the original proto message.
+    unpacked_value = proto_utils.unpack_proto_any(raw_property_value)
+    self.assertEqual(unpacked_value.string_value, 'message in a proto')
+
   def testGetMetadataValueTypePrimitiveValue(self):
     self.assertEqual(
         data_types_utils.get_metadata_value_type(1), metadata_store_pb2.INT)
@@ -263,11 +336,6 @@ class DataTypesUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
     pb = metadata_store_pb2.Value()
     data_types_utils.set_metadata_value(pb, value)
     self.assertEqual(pb, expected_pb)
-
-  def testSetMetadataValueUnsupportedType(self):
-    pb = metadata_store_pb2.Value()
-    with self.assertRaises(ValueError):
-      data_types_utils.set_metadata_value(pb, {'a': 1})
 
   def testSetParameterValue(self):
     actual_int = pipeline_pb2.Value()
@@ -358,11 +426,127 @@ class DataTypesUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
         expected_list,
         data_types_utils.set_parameter_value(actual_list, ['true', 'false']))
 
-  def testSetParameterValueUnsupportedType(self):
-    actual_value = pipeline_pb2.Value()
-    with self.assertRaises(ValueError):
-      data_types_utils.set_parameter_value(actual_value, {'a': 1})
-
-
-if __name__ == '__main__':
-  tf.test.main()
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='_dict[str,int]',
+          value={
+              'a': 1,
+              'b': 2
+          },
+          expected=r"""field_value {
+                        string_value: '{\"a\": 1, \"b\": 2}'
+                      }
+                      schema {
+                        value_type {
+                          dict_type {
+                          }
+                        }
+                      }"""),
+      dict(
+          testcase_name='_dict[str,float]',
+          value={
+              'a': 1.,
+              'b': 2.
+          },
+          expected=r"""field_value {
+                        string_value: '{\"a\": 1.0, \"b\": 2.0}'
+                      }
+                      schema {
+                        value_type {
+                          dict_type {
+                          }
+                        }
+                      }"""),
+      dict(
+          testcase_name='_dict[str,list[bool]]',
+          value={
+              'a': [True, False],
+              'b': [False]
+          },
+          expected=r"""field_value {
+                        string_value: '{\"a\": \"[true, false]\", \"b\": \"[false]\"}'
+                      }
+                      schema {
+                        value_type {
+                          dict_type {
+                            list_type {
+                              boolean_type {
+                              }
+                            }
+                          }
+                        }
+                      }"""),
+      dict(
+          testcase_name='_dict[str,dict[str,str]]',
+          value={'a': {
+              'a': 1,
+              'b': 2
+          }},
+          expected=r"""field_value {
+                        string_value: '{\"a\": \"{\\"a\\": 1, \\"b\\": 2}\"}'
+                      }
+                      schema {
+                        value_type {
+                          dict_type {
+                            dict_type {
+                            }
+                          }
+                        }
+                      }"""),
+      dict(
+          testcase_name='_list[float]',
+          value=[1., 2.],
+          expected=r"""field_value {
+                        string_value: '[1.0, 2.0]'
+                      }
+                      schema {
+                        value_type {
+                          list_type {
+                          }
+                        }
+                      }"""),
+      dict(
+          testcase_name='_list[dict[str,bool]]',
+          value=[{
+              'a': True
+          }, {
+              'b': False
+          }],
+          expected=r"""field_value {
+                        string_value: '[\"{\\"a\\": true}\", \"{\\"b\\": false}\"]'
+                      }
+                      schema {
+                        value_type {
+                          list_type {
+                            dict_type {
+                              boolean_type {
+                              }
+                            }
+                          }
+                        }
+                      }"""),
+      dict(
+          testcase_name='_list[dict[str,list[int]]]',
+          value=[{
+              'a': [1, 2]
+          }],
+          expected=r"""field_value {
+                        string_value: '[\"{\\"a\\": \\"[1, 2]\\"}\"]'
+                      }
+                      schema {
+                        value_type {
+                          list_type {
+                            dict_type {
+                              list_type {
+                              }
+                            }
+                          }
+                        }
+                      }"""),
+  )
+  def testSetParameterValueJson(self, value, expected):
+    actual_list = pipeline_pb2.Value()
+    expected_list = pipeline_pb2.Value()
+    text_format.Parse(expected, expected_list)
+    self.assertEqual(expected_list,
+                     data_types_utils.set_parameter_value(actual_list, value))

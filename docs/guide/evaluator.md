@@ -15,7 +15,7 @@ the [Pusher](pusher.md) that it is ok to push the model to production.
 
 *   Consumes:
     *   An eval split from
-        [ExampleGen](https://www.tensorflow.org/tfx/guide/examplegen)
+        [Examples][tfx.v1.types.standard_artifacts.Examples]
     *   A trained model from [Trainer](trainer.md)
     *   A previously blessed model (if validation to be performed)
 *   Emits:
@@ -36,11 +36,11 @@ component.
 
 To setup the evaluator the following information is needed:
 
-*   Metrics to configure (only reqired if additional metrics are being added
+*   Metrics to configure (only required if additional metrics are being added
     outside of those saved with the model). See
     [Tensorflow Model Analysis Metrics](https://github.com/tensorflow/model-analysis/blob/master/g3doc/metrics.md)
     for more information.
-*   Slices to configure (if not slices are given then an "overall" slice will be
+*   Slices to configure (if no slices are given then an "overall" slice will be
     added by default). See
     [Tensorflow Model Analysis Setup](https://github.com/tensorflow/model-analysis/blob/master/g3doc/setup.md)
     for more information.
@@ -66,9 +66,7 @@ import tensorflow_model_analysis as tfma
 eval_config = tfma.EvalConfig(
     model_specs=[
         # This assumes a serving model with signature 'serving_default'. If
-        # using estimator based EvalSavedModel, add signature_name='eval' and
-        # remove the label_key. Note, if using a TFLite model, then you must set
-        # model_type='tf_lite'.
+        # using a TFLite model, then you must set model_type='tf_lite'.
         tfma.ModelSpec(label_key='<label_key>')
     ],
     metrics_specs=[
@@ -120,7 +118,7 @@ The evaluator produces an
 (and optionally a
 [ValidationResult](https://www.tensorflow.org/tfx/model_analysis/api_docs/python/tfma/ValidationResult)
 if validation was used) that can be loaded using [TFMA](tfma.md). The following
-is an exmmple of how to load the results into a Jupyter notebook:
+is an example of how to load the results into a Jupyter notebook:
 
 ```
 import tensorflow_model_analysis as tfma
@@ -142,4 +140,4 @@ if not validation_result.validation_ok:
 ```
 
 More details are available in the
-[Evaluator API reference](https://www.tensorflow.org/tfx/api_docs/python/tfx/v1/components/Evaluator).
+[Evaluator API reference][tfx.v1.components.Evaluator].

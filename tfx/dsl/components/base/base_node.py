@@ -14,15 +14,19 @@
 """Base class for TFX nodes."""
 
 import abc
+import copy
 from typing import Any, Dict, Optional, Type
 
 from tfx.dsl.components.base import base_driver
 from tfx.dsl.components.base import base_executor
 from tfx.dsl.components.base import executor_spec as executor_spec_module
-from tfx.dsl.context_managers import context_manager
+from tfx.dsl.context_managers import dsl_context_registry
+from tfx.dsl.experimental.node_execution_options import utils
 from tfx.utils import deprecation_utils
 from tfx.utils import doc_controls
 from tfx.utils import json_utils
+from tfx.utils import name_utils
+import typing_extensions
 
 
 def _abstract_property() -> Any:
@@ -32,6 +36,15 @@ def _abstract_property() -> Any:
 
 class BaseNode(json_utils.Jsonable, abc.ABC):
   """Base class for a node in TFX pipeline."""
+
+  def __new__(cls, *args, **kwargs):
+    # Record invocation details for tracing. No backwards-compatibility
+    # guarantees; for TFX-internal use only.
+    result = super(BaseNode, cls).__new__(cls)
+    result._CONSTRUCT_CLS = cls
+    result._CONSTRUCT_ARGS = args
+    result._CONSTRUCT_KWARGS = kwargs
+    return result
 
   def __init__(
       self,
@@ -58,7 +71,8 @@ class BaseNode(json_utils.Jsonable, abc.ABC):
     self._upstream_nodes = set()
     self._downstream_nodes = set()
     self._id = None
-    context_manager.put_node(self)
+    self._node_execution_options: Optional[utils.NodeExecutionOptions] = None
+    dsl_context_registry.get().put_node(self)
 
   @doc_controls.do_not_doc_in_subclasses
   def to_json_dict(self) -> Dict[str, Any]:
@@ -71,8 +85,8 @@ class BaseNode(json_utils.Jsonable, abc.ABC):
   @doc_controls.do_not_doc_in_subclasses
   def get_class_type(cls) -> str:
     nondeprecated_class = deprecation_utils.get_first_nondeprecated_class(cls)
-    return '.'.join(
-        [nondeprecated_class.__module__, nondeprecated_class.__name__])
+    # TODO(b/221166027): Turn strict_check=True once failing tests are fixed.
+    return name_utils.get_full_name(nondeprecated_class, strict_check=False)
 
   @property
   @doc_controls.do_not_doc_in_subclasses
@@ -115,8 +129,9 @@ class BaseNode(json_utils.Jsonable, abc.ABC):
   def id(self, id: str) -> None:  # pylint: disable=redefined-builtin
     self._id = id
 
+  # TODO(kmonte): Update this to Self once we're on 3.11 everywhere
   @doc_controls.do_not_doc_in_subclasses
-  def with_id(self, id: str) -> 'BaseNode':  # pylint: disable=redefined-builtin
+  def with_id(self, id: str) -> typing_extensions.Self:  # pylint: disable=redefined-builtin
     self._id = id
     return self
 
@@ -139,6 +154,26 @@ class BaseNode(json_utils.Jsonable, abc.ABC):
   @doc_controls.do_not_doc_in_subclasses
   def upstream_nodes(self):
     return self._upstream_nodes
+
+  @property
+  @doc_controls.do_not_doc_in_subclasses
+  def node_execution_options(self) -> Optional[utils.NodeExecutionOptions]:
+    return self._node_execution_options
+
+  @node_execution_options.setter
+  @doc_controls.do_not_doc_in_subclasses
+  def node_execution_options(
+      self,
+      node_execution_options: utils.NodeExecutionOptions
+  ):
+    self._node_execution_options = copy.deepcopy(node_execution_options)
+
+  # TODO(kmonte): Update this to Self once we're on 3.11 everywhere
+  def with_node_execution_options(
+      self, node_execution_options: utils.NodeExecutionOptions
+  ) -> typing_extensions.Self:
+    self.node_execution_options = node_execution_options
+    return self
 
   @doc_controls.do_not_doc_in_subclasses
   def add_upstream_node(self, upstream_node):

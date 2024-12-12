@@ -13,20 +13,32 @@
 # limitations under the License.
 """Tests for tfx.types.artifact."""
 
+import gc
 import json
+import importlib
+import pytest
 import textwrap
 from unittest import mock
 
-
-import absl
+from absl import logging
 import tensorflow as tf
 from tfx.types import artifact
+from tfx.types import system_artifacts
 from tfx.types import value_artifact
-from tfx.types.system_artifacts import Dataset
 from tfx.utils import json_utils
 
+from google.protobuf import struct_pb2
 from google.protobuf import json_format
 from ml_metadata.proto import metadata_store_pb2
+
+
+@pytest.fixture(scope="module", autouse=True)
+def cleanup():
+  yield
+  importlib.reload(struct_pb2)
+
+
+Dataset = system_artifacts.Dataset
 
 
 class _MyArtifact(artifact.Artifact):
@@ -36,8 +48,15 @@ class _MyArtifact(artifact.Artifact):
       'int2': artifact.Property(type=artifact.PropertyType.INT),
       'float1': artifact.Property(type=artifact.PropertyType.FLOAT),
       'float2': artifact.Property(type=artifact.PropertyType.FLOAT),
+      'proto1': artifact.Property(
+          type=artifact.PropertyType.PROTO
+      ),  # Expected proto type: google.protobuf.Value
+      'proto2': artifact.Property(
+          type=artifact.PropertyType.PROTO
+      ),  # Expected proto type: google.protobuf.Value
       'string1': artifact.Property(type=artifact.PropertyType.STRING),
       'string2': artifact.Property(type=artifact.PropertyType.STRING),
+      'bool1': artifact.Property(type=artifact.PropertyType.BOOLEAN),
   }
 
 _MyArtifact2 = artifact._ArtifactType(  # pylint: disable=invalid-name
@@ -47,8 +66,8 @@ _MyArtifact2 = artifact._ArtifactType(  # pylint: disable=invalid-name
         'int2': artifact.Property(type=artifact.PropertyType.INT),
         'float1': artifact.Property(type=artifact.PropertyType.FLOAT),
         'float2': artifact.Property(type=artifact.PropertyType.FLOAT),
-        'string1': artifact.Property(type=artifact.PropertyType.STRING),
-        'string2': artifact.Property(type=artifact.PropertyType.STRING),
+        'proto1': artifact.Property(type=artifact.PropertyType.PROTO),  # Expected proto type: google.protobuf.Value
+        'proto2': artifact.Property(type=artifact.PropertyType.PROTO),  # Expected proto type: google.protobuf.Value
         'jsonvalue_string':
             artifact.Property(type=artifact.PropertyType.JSON_VALUE),
         'jsonvalue_dict':
@@ -63,6 +82,9 @@ _MyArtifact2 = artifact._ArtifactType(  # pylint: disable=invalid-name
             artifact.Property(type=artifact.PropertyType.JSON_VALUE),
         'jsonvalue_empty':
             artifact.Property(type=artifact.PropertyType.JSON_VALUE),
+        'string1': artifact.Property(type=artifact.PropertyType.STRING),
+        'string2': artifact.Property(type=artifact.PropertyType.STRING),
+        'bool1': artifact.Property(type=artifact.PropertyType.BOOLEAN),
     })
 
 _mlmd_artifact_type = metadata_store_pb2.ArtifactType()
@@ -75,9 +97,13 @@ json_format.Parse(
             'float1': 'DOUBLE',
             'float2': 'DOUBLE',
             'string1': 'STRING',
-            'string2': 'STRING'
+            'string2': 'STRING',
+            'proto1': 'PROTO',
+            'proto2': 'PROTO',
+            'bool1': 'BOOLEAN',
         }
-    }), _mlmd_artifact_type)
+    }),
+    _mlmd_artifact_type)
 _MyArtifact3 = artifact._ArtifactType(mlmd_artifact_type=_mlmd_artifact_type)  # pylint: disable=invalid-name
 
 
@@ -113,14 +139,6 @@ _MyArtifact6 = artifact._ArtifactType(  # pylint: disable=invalid-name
     })
 
 
-class _ArtifactWithInvalidAnnotation(artifact.Artifact):
-  TYPE_NAME = 'InvalidAnnotationArtifact'
-  TYPE_ANNOTATION = artifact.Artifact
-  PROPERTIES = {
-      'int1': artifact.Property(type=artifact.PropertyType.INT),
-  }
-
-
 class _MyValueArtifact(value_artifact.ValueArtifact):
   TYPE_NAME = 'MyValueTypeName'
 
@@ -146,6 +164,18 @@ _BAD_URI = '/tmp/to/a/bad/dir'
 
 class ArtifactTest(tf.test.TestCase):
 
+  def tearDown(self):
+    # This cleans up __subclasses__() that has InvalidAnnotation artifact classes.
+    gc.collect()
+
+  def assertProtoEquals(self, proto1, proto2):
+    if type(proto1) is not type(proto2):
+      # GetProtoType() doesn't return the orignal type.
+      new_proto2 = type(proto1)()
+      new_proto2.CopyFrom(proto2)
+      return super().assertProtoEquals(proto1, new_proto2)
+    return super().assertProtoEquals(proto1, proto2)
+
   def testArtifact(self):
     instance = _MyArtifact()
 
@@ -155,6 +185,8 @@ class ArtifactTest(tf.test.TestCase):
     self.assertEqual(0, instance.type_id)
     self.assertEqual('MyTypeName', instance.type_name)
     self.assertEqual('', instance.state)
+    self.assertFalse(instance.is_external)
+    self.assertEqual('', instance.external_id)
 
     # Default property does not have span or split_names.
     with self.assertRaisesRegex(AttributeError, "has no property 'span'"):
@@ -164,6 +196,9 @@ class ArtifactTest(tf.test.TestCase):
       instance.split_names  # pylint: disable=pointless-statement
 
     # Test property setters.
+    instance.name = 'test_artifact'
+    self.assertEqual('test_artifact', instance.name)
+
     instance.uri = '/tmp/uri2'
     self.assertEqual('/tmp/uri2', instance.uri)
 
@@ -176,6 +211,9 @@ class ArtifactTest(tf.test.TestCase):
     instance.state = artifact.ArtifactState.DELETED
     self.assertEqual(artifact.ArtifactState.DELETED, instance.state)
 
+    instance.is_external = True
+    self.assertTrue(instance.is_external)
+
     # Default artifact does not have span.
     with self.assertRaisesRegex(AttributeError, "unknown property 'span'"):
       instance.span = 20190101
@@ -184,9 +222,11 @@ class ArtifactTest(tf.test.TestCase):
                                 "unknown property 'split_names'"):
       instance.split_names = ''
 
+    self.assertFalse(instance.has_custom_property('int_key'))
     instance.set_int_custom_property('int_key', 20)
     self.assertEqual(
         20, instance.mlmd_artifact.custom_properties['int_key'].int_value)
+    self.assertTrue(instance.has_custom_property('int_key'))
 
     instance.set_string_custom_property('string_key', 'string_value')
     self.assertEqual(
@@ -197,11 +237,31 @@ class ArtifactTest(tf.test.TestCase):
     self.assertEqual(
         0.5, instance.mlmd_artifact.custom_properties['float_key'].double_value)
 
+    instance.set_bool_custom_property('bool_key', True)
+    self.assertTrue(
+        instance.mlmd_artifact.custom_properties['bool_key'].bool_value
+    )
+    self.assertFalse(instance.get_bool_custom_property('fake_key'))
+
+    instance.mlmd_artifact.external_id = (
+        'mlmd://prod:owner/project_name:pipeline_name:type:artifact:100'
+    )
+    self.assertEqual(
+        'mlmd://prod:owner/project_name:pipeline_name:type:artifact:100',
+        instance.external_id,
+    )
+
     self.assertEqual(
         textwrap.dedent("""\
         Artifact(artifact: id: 1
         type_id: 2
         uri: "/tmp/uri2"
+        custom_properties {
+          key: "bool_key"
+          value {
+            bool_value: true
+          }
+        }
         custom_properties {
           key: "float_key"
           value {
@@ -215,9 +275,15 @@ class ArtifactTest(tf.test.TestCase):
           }
         }
         custom_properties {
-          key: "state"
+          key: "is_external"
           value {
-            string_value: "deleted"
+            int_value: 1
+          }
+        }
+        custom_properties {
+          key: "name"
+          value {
+            string_value: "test_artifact"
           }
         }
         custom_properties {
@@ -226,7 +292,14 @@ class ArtifactTest(tf.test.TestCase):
             string_value: "string_value"
           }
         }
+        state: DELETED
+        name: "test_artifact"
+        external_id: "mlmd://prod:owner/project_name:pipeline_name:type:artifact:100"
         , artifact_type: name: "MyTypeName"
+        properties {
+          key: "bool1"
+          value: BOOLEAN
+        }
         properties {
           key: "float1"
           value: DOUBLE
@@ -244,6 +317,14 @@ class ArtifactTest(tf.test.TestCase):
           value: INT
         }
         properties {
+          key: "proto1"
+          value: PROTO
+        }
+        properties {
+          key: "proto2"
+          value: PROTO
+        }
+        properties {
           key: "string1"
           value: STRING
         }
@@ -251,7 +332,9 @@ class ArtifactTest(tf.test.TestCase):
           key: "string2"
           value: STRING
         }
-        )"""), str(instance))
+        )"""),
+        str(instance),
+    )
 
     # Test json serialization.
     json_dict = json_utils.dumps(instance)
@@ -277,16 +360,26 @@ class ArtifactTest(tf.test.TestCase):
       self.assertEqual(0.0, my_artifact.float2)
       my_artifact.float1 = 111.1
       my_artifact.float2 = 222.2
+      self.assertIsNone(my_artifact.proto1)
+      self.assertIsNone(my_artifact.proto2)
+      my_artifact.proto1 = struct_pb2.Value(string_value='pb1')
+      my_artifact.proto2 = struct_pb2.Value(null_value=0)
       self.assertEqual('', my_artifact.string1)
       self.assertEqual('', my_artifact.string2)
       my_artifact.string1 = '111'
       my_artifact.string2 = '222'
+      self.assertEqual(False, my_artifact.bool1)
+      my_artifact.bool1 = True
       self.assertEqual(my_artifact.int1, 111)
       self.assertEqual(my_artifact.int2, 222)
       self.assertEqual(my_artifact.float1, 111.1)
       self.assertEqual(my_artifact.float2, 222.2)
       self.assertEqual(my_artifact.string1, '111')
       self.assertEqual(my_artifact.string2, '222')
+      self.assertEqual(my_artifact.bool1, True)
+      self.assertProtoEquals(my_artifact.proto1,
+                             struct_pb2.Value(string_value='pb1'))
+      self.assertProtoEquals(my_artifact.proto2, struct_pb2.Value(null_value=0))
 
   def testArtifactJsonValue(self):
     # Construct artifact.
@@ -297,10 +390,35 @@ class ArtifactTest(tf.test.TestCase):
     my_artifact.jsonvalue_float = 3.14
     my_artifact.jsonvalue_list = ['a1', '2', 3, {'4': 5.0}]
     my_artifact.jsonvalue_null = None
+    self.assertFalse(my_artifact.has_custom_property('customjson1'))
+    self.assertFalse(my_artifact.has_custom_property('customjson2'))
     my_artifact.set_json_value_custom_property('customjson1', {})
     my_artifact.set_json_value_custom_property('customjson2', ['a', 'b', 3])
     my_artifact.set_json_value_custom_property('customjson3', 'xyz')
     my_artifact.set_json_value_custom_property('customjson4', 3.14)
+    my_artifact.set_json_value_custom_property('customjson5', False)
+
+    # Test that the JsonValue getters return the same values we just set
+    self.assertEqual(my_artifact.jsonvalue_string, 'aaa')
+    self.assertEqual(my_artifact.jsonvalue_dict, {'k1': ['v1', 'v2', 333]})
+    self.assertEqual(my_artifact.jsonvalue_int, 123)
+    self.assertEqual(my_artifact.jsonvalue_float, 3.14)
+    self.assertEqual(my_artifact.jsonvalue_list, ['a1', '2', 3, {'4': 5.0}])
+    self.assertIsNone(my_artifact.jsonvalue_null)
+    self.assertEmpty(my_artifact.get_json_value_custom_property('customjson1'))
+    self.assertEqual(
+        my_artifact.get_json_value_custom_property('customjson2'),
+        ['a', 'b', 3])
+    self.assertEqual(
+        my_artifact.get_json_value_custom_property('customjson3'), 'xyz')
+    self.assertEqual(
+        my_artifact.get_json_value_custom_property('customjson4'), 3.14)
+    self.assertEqual(
+        my_artifact.get_json_value_custom_property('customjson5'), False
+    )
+    self.assertEqual(my_artifact.get_bool_custom_property('customjson5'), False)
+    self.assertTrue(my_artifact.has_custom_property('customjson1'))
+    self.assertTrue(my_artifact.has_custom_property('customjson2'))
 
     # Test string and proto serialization.
     self.assertEqual(
@@ -456,7 +574,24 @@ class ArtifactTest(tf.test.TestCase):
             }
           }
         }
+        custom_properties {
+          key: "customjson5"
+          value {
+            struct_value {
+              fields {
+                key: "__value__"
+                value {
+                  bool_value: false
+                }
+              }
+            }
+          }
+        }
         , artifact_type: name: "MyTypeName2"
+        properties {
+          key: "bool1"
+          value: BOOLEAN
+        }
         properties {
           key: "float1"
           value: DOUBLE
@@ -500,6 +635,14 @@ class ArtifactTest(tf.test.TestCase):
         properties {
           key: "jsonvalue_string"
           value: STRUCT
+        }
+        properties {
+          key: "proto1"
+          value: PROTO
+        }
+        properties {
+          key: "proto2"
+          value: PROTO
         }
         properties {
           key: "string1"
@@ -747,7 +890,24 @@ class ArtifactTest(tf.test.TestCase):
             }
           }
         }
+        custom_properties {
+          key: "customjson5"
+          value {
+            struct_value {
+              fields {
+                key: "__value__"
+                value {
+                  bool_value: false
+                }
+              }
+            }
+          }
+        }
         , artifact_type: name: "MyTypeName2"
+        properties {
+          key: "bool1"
+          value: BOOLEAN
+        }
         properties {
           key: "float1"
           value: DOUBLE
@@ -793,6 +953,228 @@ class ArtifactTest(tf.test.TestCase):
           value: STRUCT
         }
         properties {
+          key: "proto1"
+          value: PROTO
+        }
+        properties {
+          key: "proto2"
+          value: PROTO
+        }
+        properties {
+          key: "string1"
+          value: STRING
+        }
+        properties {
+          key: "string2"
+          value: STRING
+        }
+        )"""), str(copied_artifact))
+
+  def testArtifactProtoValue(self):
+    # Construct artifact.
+    my_artifact = _MyArtifact2()
+    self.assertFalse(my_artifact.has_property('proto1'))
+    self.assertFalse(my_artifact.has_custom_property('customproto2'))
+    my_artifact.proto1 = None
+    my_artifact.proto2 = struct_pb2.Value(string_value='aaa')
+    my_artifact.set_proto_custom_property('customproto1', None)
+    my_artifact.set_proto_custom_property('customproto2',
+                                          struct_pb2.Value(string_value='bbb'))
+
+    # Test that the JsonValue getters return the same values we just set
+    self.assertIsNone(my_artifact.proto1)
+    self.assertProtoEquals(my_artifact.proto2,
+                           struct_pb2.Value(string_value='aaa'))
+    self.assertIsNone(
+        my_artifact.get_json_value_custom_property('customproto1'))
+    self.assertProtoEquals(
+        my_artifact.get_json_value_custom_property('customproto2'),
+        struct_pb2.Value(string_value='bbb'))
+    self.assertTrue(my_artifact.has_property('proto1'))
+    self.assertTrue(my_artifact.has_custom_property('customproto2'))
+
+    # Test string and proto serialization.
+    self.assertEqual(
+        textwrap.dedent("""\
+        Artifact(artifact: properties {
+          key: "proto2"
+          value {
+            proto_value {
+              type_url: "type.googleapis.com/google.protobuf.Value"
+              value: "\\032\\003aaa"
+            }
+          }
+        }
+        custom_properties {
+          key: "customproto2"
+          value {
+            proto_value {
+              type_url: "type.googleapis.com/google.protobuf.Value"
+              value: "\\032\\003bbb"
+            }
+          }
+        }
+        , artifact_type: name: "MyTypeName2"
+        properties {
+          key: "bool1"
+          value: BOOLEAN
+        }
+        properties {
+          key: "float1"
+          value: DOUBLE
+        }
+        properties {
+          key: "float2"
+          value: DOUBLE
+        }
+        properties {
+          key: "int1"
+          value: INT
+        }
+        properties {
+          key: "int2"
+          value: INT
+        }
+        properties {
+          key: "jsonvalue_dict"
+          value: STRUCT
+        }
+        properties {
+          key: "jsonvalue_empty"
+          value: STRUCT
+        }
+        properties {
+          key: "jsonvalue_float"
+          value: STRUCT
+        }
+        properties {
+          key: "jsonvalue_int"
+          value: STRUCT
+        }
+        properties {
+          key: "jsonvalue_list"
+          value: STRUCT
+        }
+        properties {
+          key: "jsonvalue_null"
+          value: STRUCT
+        }
+        properties {
+          key: "jsonvalue_string"
+          value: STRUCT
+        }
+        properties {
+          key: "proto1"
+          value: PROTO
+        }
+        properties {
+          key: "proto2"
+          value: PROTO
+        }
+        properties {
+          key: "string1"
+          value: STRING
+        }
+        properties {
+          key: "string2"
+          value: STRING
+        }
+        )"""), str(my_artifact))
+
+    copied_artifact = _MyArtifact2()
+    copied_artifact.set_mlmd_artifact(my_artifact.mlmd_artifact)
+
+    self.assertIsNone(copied_artifact.proto1)
+    self.assertProtoEquals(copied_artifact.proto2,
+                           struct_pb2.Value(string_value='aaa'))
+    self.assertIsNone(copied_artifact.get_proto_custom_property('customproto1'))
+    self.assertProtoEquals(
+        copied_artifact.get_proto_custom_property('customproto2'),
+        struct_pb2.Value(string_value='bbb'))
+
+    # Modify nested structure and check proto serialization reflects changes.
+    copied_artifact.proto2.string_value = 'updated1'
+    copied_artifact.get_proto_custom_property(
+        'customproto2').string_value = 'updated_custom'
+
+    self.assertEqual(
+        textwrap.dedent("""\
+        Artifact(artifact: properties {
+          key: "proto2"
+          value {
+            proto_value {
+              type_url: "type.googleapis.com/google.protobuf.Value"
+              value: "\\032\\010updated1"
+            }
+          }
+        }
+        custom_properties {
+          key: "customproto2"
+          value {
+            proto_value {
+              type_url: "type.googleapis.com/google.protobuf.Value"
+              value: "\\032\\016updated_custom"
+            }
+          }
+        }
+        , artifact_type: name: "MyTypeName2"
+        properties {
+          key: "bool1"
+          value: BOOLEAN
+        }
+        properties {
+          key: "float1"
+          value: DOUBLE
+        }
+        properties {
+          key: "float2"
+          value: DOUBLE
+        }
+        properties {
+          key: "int1"
+          value: INT
+        }
+        properties {
+          key: "int2"
+          value: INT
+        }
+        properties {
+          key: "jsonvalue_dict"
+          value: STRUCT
+        }
+        properties {
+          key: "jsonvalue_empty"
+          value: STRUCT
+        }
+        properties {
+          key: "jsonvalue_float"
+          value: STRUCT
+        }
+        properties {
+          key: "jsonvalue_int"
+          value: STRUCT
+        }
+        properties {
+          key: "jsonvalue_list"
+          value: STRUCT
+        }
+        properties {
+          key: "jsonvalue_null"
+          value: STRUCT
+        }
+        properties {
+          key: "jsonvalue_string"
+          value: STRUCT
+        }
+        properties {
+          key: "proto1"
+          value: PROTO
+        }
+        properties {
+          key: "proto2"
+          value: PROTO
+        }
+        properties {
           key: "string1"
           value: STRING
         }
@@ -833,6 +1215,7 @@ class ArtifactTest(tf.test.TestCase):
     my_artifact = _MyArtifact()
     self.assertEqual(0, my_artifact.int1)
     self.assertEqual(0, my_artifact.int2)
+    self.assertFalse(my_artifact.has_property('int1'))
     my_artifact.int1 = 111
     my_artifact.int2 = 222
     self.assertEqual('', my_artifact.string1)
@@ -841,6 +1224,7 @@ class ArtifactTest(tf.test.TestCase):
     my_artifact.string2 = '222'
     self.assertEqual(my_artifact.int1, 111)
     self.assertEqual(my_artifact.int2, 222)
+    self.assertTrue(my_artifact.has_property('int1'))
     self.assertEqual(my_artifact.string1, '111')
     self.assertEqual(my_artifact.string2, '222')
     self.assertEqual(my_artifact.get_string_custom_property('invalid'), '')
@@ -873,16 +1257,22 @@ class ArtifactTest(tf.test.TestCase):
     original.uri = '/my/path'
     original.int1 = 111
     original.int2 = 222
+    original.proto1 = struct_pb2.Value(string_value='abc')
+    original.proto2 = struct_pb2.Value(string_value='xyz')
     original.string1 = '111'
     original.string2 = '222'
 
     serialized = original.to_json_dict()
 
     rehydrated = artifact.Artifact.from_json_dict(serialized)
-    absl.logging.warning.assert_not_called()
+    logging.warning.assert_not_called()
     self.assertIs(rehydrated.__class__, _MyArtifact)
     self.assertEqual(rehydrated.int1, 111)
     self.assertEqual(rehydrated.int2, 222)
+    self.assertProtoEquals(rehydrated.proto1,
+                           struct_pb2.Value(string_value='abc'))
+    self.assertProtoEquals(rehydrated.proto2,
+                           struct_pb2.Value(string_value='xyz'))
     self.assertEqual(rehydrated.string1, '111')
     self.assertEqual(rehydrated.string2, '222')
 
@@ -892,6 +1282,8 @@ class ArtifactTest(tf.test.TestCase):
     original.uri = '/my/path'
     original.int1 = 111
     original.int2 = 222
+    original.proto1 = struct_pb2.Value(string_value='abc')
+    original.proto2 = struct_pb2.Value(string_value='xyz')
     original.string1 = '111'
     original.string2 = '222'
 
@@ -899,10 +1291,14 @@ class ArtifactTest(tf.test.TestCase):
     serialized['__artifact_class_name__'] = 'MissingClassName'
 
     rehydrated = artifact.Artifact.from_json_dict(serialized)
-    absl.logging.warning.assert_called_once()
+    logging.warning.assert_called_once()
     self.assertIs(rehydrated.__class__, artifact.Artifact)
     self.assertEqual(rehydrated.int1, 111)
     self.assertEqual(rehydrated.int2, 222)
+    self.assertProtoEquals(rehydrated.proto1,
+                           struct_pb2.Value(string_value='abc'))
+    self.assertProtoEquals(rehydrated.proto2,
+                           struct_pb2.Value(string_value='xyz'))
     self.assertEqual(rehydrated.string1, '111')
     self.assertEqual(rehydrated.string2, '222')
 
@@ -911,6 +1307,10 @@ class ArtifactTest(tf.test.TestCase):
     self.assertIs(rehydrated.__class__, artifact.Artifact)
     self.assertEqual(rehydrated.int1, 111)
     self.assertEqual(rehydrated.int2, 222)
+    self.assertProtoEquals(rehydrated.proto1,
+                           struct_pb2.Value(string_value='abc'))
+    self.assertProtoEquals(rehydrated.proto2,
+                           struct_pb2.Value(string_value='xyz'))
     self.assertEqual(rehydrated.string1, '111')
     self.assertEqual(rehydrated.string2, '222')
 
@@ -919,6 +1319,7 @@ class ArtifactTest(tf.test.TestCase):
     original.id = 1
     original.uri = '/my/path'
     original.int1 = 111
+    original.proto1 = struct_pb2.Value(string_value='abc')
     original.string1 = '111'
     original.set_string_custom_property('my_custom_property', 'aaa')
 
@@ -926,13 +1327,15 @@ class ArtifactTest(tf.test.TestCase):
     copied.id = 2
     copied.uri = '/some/other/path'
     copied.int1 = 333
-    original.set_string_custom_property('my_custom_property', 'bbb')
+    copied.proto1 = struct_pb2.Value(string_value='xyz')
+    copied.set_string_custom_property('my_custom_property', 'bbb')
     copied.copy_from(original)
 
     # id should not be overridden.
     self.assertEqual(copied.id, 2)
     self.assertEqual(original.uri, copied.uri)
     self.assertEqual(original.int1, copied.int1)
+    self.assertProtoEquals(original.proto1, copied.proto1)
     self.assertEqual(original.string1, copied.string1)
     self.assertEqual(
         original.get_string_custom_property('my_custom_property'),
@@ -976,10 +1379,28 @@ class ArtifactTest(tf.test.TestCase):
                      metadata_store_pb2.ArtifactType.DATASET)
 
   def testInvalidTypeAnnotation(self):
+    class _ArtifactWithInvalidAnnotation(artifact.Artifact):
+      TYPE_NAME = 'InvalidAnnotationArtifact'
+      TYPE_ANNOTATION = artifact.Artifact
+      PROPERTIES = {
+          'int1': artifact.Property(type=artifact.PropertyType.INT),
+      }
+
     with self.assertRaisesRegex(
         ValueError, 'is not a subclass of SystemArtifact'):
       _ArtifactWithInvalidAnnotation()
 
+  def testSetArtifactStateAsPublishedSetsMlmdStateToLive(self):
+    tfx_artifact = _MyArtifact()
+    self.assertFalse(tfx_artifact.mlmd_artifact.HasField('state'))
+    tfx_artifact.state = artifact.ArtifactState.PUBLISHED
+    self.assertEqual(tfx_artifact.mlmd_artifact.state,
+                     metadata_store_pb2.Artifact.State.LIVE)
 
-if __name__ == '__main__':
-  tf.test.main()
+  def testSetArtifactUnknownStateSetsMlmdStateToUnknown(self):
+    tfx_artifact = _MyArtifact()
+    self.assertFalse(tfx_artifact.mlmd_artifact.HasField('state'))
+    tfx_artifact.state = 'foobar'
+    self.assertEqual(tfx_artifact.mlmd_artifact.state,
+                     metadata_store_pb2.Artifact.State.UNKNOWN)
+    self.assertEqual(tfx_artifact.state, 'foobar')

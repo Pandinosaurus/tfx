@@ -13,11 +13,19 @@
 # limitations under the License.
 """Tests for tfx.utils.test_case_utils."""
 
+import copy
 import os
 import unittest
 
-import tensorflow as tf
+from tfx import types
+from tfx.types import standard_artifacts
 from tfx.utils import test_case_utils
+
+
+def _create_artifact(uri: str) -> types.Artifact:
+  artifact = standard_artifacts.Model()
+  artifact.uri = uri
+  return artifact
 
 
 class TempWorkingDirTest(test_case_utils.TfxTest):
@@ -88,6 +96,22 @@ class TestCaseUtilsTest(test_case_utils.TfxTest):
       self.assertEqual(os.environ['HOME'], new_home)
     self.assertEqual(os.getenv('HOME'), old_home)
 
+  def testAssertArtifactMapsEqual_equalMapsPassesAssertion(self):
+    expected_artifacts = {
+        'artifact1': [_create_artifact('uri1a'),
+                      _create_artifact('uri1b')],
+        'artifact2': [_create_artifact('uri2')],
+    }
+    actual_artifacts = copy.deepcopy(expected_artifacts)
+    self.assertArtifactMapsEqual(expected_artifacts, actual_artifacts)
 
-if __name__ == '__main__':
-  tf.test.main()
+  def testAssertArtifactMapsEqual_differingMapsFailsAssertion(self):
+    expected_artifacts = {
+        'artifact1': [_create_artifact('uri1a'),
+                      _create_artifact('uri1b')],
+        'artifact2': [_create_artifact('uri2')],
+    }
+    actual_artifacts = copy.deepcopy(expected_artifacts)
+    actual_artifacts['artifact1'][1].set_int_custom_property('key', 5)
+    with self.assertRaises(AssertionError):
+      self.assertArtifactMapsEqual(expected_artifacts, actual_artifacts)

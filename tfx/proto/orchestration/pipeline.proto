@@ -18,6 +18,7 @@ package tfx.orchestration;
 import "google/protobuf/any.proto";
 import "google/protobuf/descriptor.proto";
 import "ml_metadata/proto/metadata_store.proto";
+import "tfx/proto/orchestration/garbage_collection_policy.proto";
 import "tfx/proto/orchestration/placeholder.proto";
 
 // ResolverConfig is subject to change. We plan to introduce a flexible
@@ -121,6 +122,7 @@ message Value {
         ValueType list_type = 1;
         ProtoType proto_type = 2;
         BooleanType boolean_type = 3;
+        ValueType dict_type = 4;
       }
     }
 
@@ -158,6 +160,7 @@ message PropertyPredicate {
     //     operated on Dict[Text, List[Artifact]].
     string input_key = 4;
     int32 input_index = 5;
+    bool is_custom_property = 6;
   }
   // Logical operator on one element.
   message UnaryLogicalOperator {
@@ -182,16 +185,88 @@ message PropertyPredicate {
     // The right-hand side element to the logical operator.
     PropertyPredicate rhs = 3;
   }
+
   oneof operator {
     ValueComparator value_comparator = 1;
     UnaryLogicalOperator unary_logical_operator = 2;
     BinaryLogicalOperator binary_logical_operator = 3;
   }
+
+  reserved 4;
+}
+
+// InputGraph expresses a declarative input resolution logic with a graph of
+// ResolverOps and a result node. An entire InputGraph is basically a function
+// without argument that returns one of DataType value. Its result is referenced
+// from `InputSpec.InputGraphRef`.
+message InputGraph {
+  // Data type of the OpNode output. Corresponds to the
+  // tfx.dsl.resolver_op.DataType.
+  enum DataType {
+    DATA_TYPE_UNSPECIFIED = 0;
+    ARTIFACT_LIST = 1;
+    ARTIFACT_MULTIMAP = 2;
+    ARTIFACT_MULTIMAP_LIST = 3;
+  }
+
+  message Node {
+    DataType output_data_type = 1;
+
+    oneof kind {
+      OpNode op_node = 2;
+      DictNode dict_node = 3;
+      InputNode input_node = 4;
+    }
+  }
+
+  // ResolverOp instance as a input graph's node. Corresponds to the
+  // tfx.dsl.resolver_op.OpNode.
+  message OpNode {
+    // A canonical_name of ResolverOp (e.g. "tfx.internal.Unnest").
+    string op_type = 1;
+    // Generic argument type that can express either another Node's outputs
+    // or a static value.
+    message Arg {
+      oneof kind {
+        // ID of another Node instance, referring to its output.
+        string node_id = 1;
+        // Static value.
+        Value value = 2;
+      }
+    }
+    // Optional positional arguments; its kind must be `node_id`.
+    repeated Arg args = 2;
+    // Optional keyword arguments; its kind must be `value`.
+    map<string, Arg> kwargs = 3;
+  }
+
+  // Dict of other Nodes where each Node.output_data_type is ARTIFACT_LIST.
+  // Its own output_data_type in the parent Node message is ARTIFACT_MULTIMAP.
+  // Corresponds to the tfx.dsl.resolver_op.DictNode.
+  message DictNode {
+    // Map from dict key to node ID.
+    map<string, string> node_ids = 1;
+  }
+
+  // InputNode refers a NodeInputs.inputs[input_key]. Its output_data_type is
+  // always ARTIFACT_LIST.
+  // Corresponds to the tfx.dsl.resolver_op.InputNode.
+  message InputNode {
+    string input_key = 1;
+  }
+
+  // Nodes of this input graph. Key is the node ID.
+  map<string, Node> nodes = 1;
+  // The ID of the output node of the input graph. The output data type of the
+  // input graph is the output data type of the result node.
+  string result_node = 2;
 }
 
 // A proto message wrapping all information needed to query one set of artifacts
 // from MLMD.
 message InputSpec {
+  // Channel consists of a multiple MLMD filters whose result is always a
+  // homogeneous list of artifacts.
   message Channel {
     // Information to query the producer node of the artifacts.
     message ProducerNodeQuery {
@@ -228,12 +303,92 @@ message InputSpec {
     // where 'some_output_key' is the output key for the channel that evaluator
     // uses as one of its input.
     string output_key = 4;
+
+    google.protobuf.Any metadata_connection_config = 5;
   }
+
+  // Statically decided artifacts.
+  message Static {
+    repeated int64 artifact_ids = 1;
+  }
+
+  // Reference to the InputGraph result.
+  // When the InputGraph result is a ARTIFACT_MULTIMAP_LIST type, InputGraphRef
+  // is NOT simple referring a list of artifacts; instead we should consider the
+  // entire NodeInputs to know the final resolved inputs.
+  // For example, assume input graph `g1` is evaluated as:
+  //
+  //     [{"x": [x1], "y": [y1]}, {"x": [x2], "y": [y2]}]
+  //
+  // (x1, x2, y1, y2 are artifacts), and the NodeInputs is:
+  //
+  //     inputs["xx"] {
+  //       input_graph_ref {
+  //         graph_id: "g1"
+  //         key: "x"
+  //       }
+  //     }
+  //
+  // then the final resolved inputs is `[{"xx": [x1]}, {"xx": [x2]}]`, not
+  // `{"xx": [x1, x2]}`. If there is another NodeInputs "yy":
+  //
+  //     inputs["yy"] {
+  //       input_graph_ref {
+  //         graph_id: "g1"
+  //         key: "y"
+  //       }
+  //     }
+  //
+  // then the result is *zipped* as they're from the same input graph source:
+  //
+  //     [{"xx": [x1], "yy": [y1]}, {"xx": [x2], "yy": [y2]}]
+  //
+  // but otherwise the result is a *cartesian product* of them. For example if
+  // another input graph `g2` is evaluated as `[{"z": [z1]}, {"z": [z2]}]` and
+  // there is another NodeInputs "zz" referring to it, then the resolved inputs
+  // is a list of 4 dicts:
+  //
+  //     [{"xx": [x1], "zz": [z1]}, {"xx": [x1], "zz": [z2]},
+  //      {"xx": [x2], "zz": [z1]}, {"xx": [x2], "zz": [z2]}]
+  message InputGraphRef {
+    // ID of the InputGraph in NodeInputs.input_graphs.
+    string graph_id = 1;
+    // Optional dict key if the result node type is ARTIFACT_MULTIMAP or
+    // ARTIFACT_MULTIMAP_LIST.
+    string key = 2;
+  }
+
+  // A mixture of InputSpecs.
+  message Mixed {
+    enum Method {
+      UNION = 0;
+    }
+    Method method = 1;
+    repeated string input_keys = 2;
+  }
+
+  // Exactly one of `channels`, `input_graph_ref`, `mixed_inputs`, or
+  // `static_inputs` field should be set. We don't mandate oneof constraints as
+  // the legacy `channels` field is a repeated field that cannot be wrapped into
+  // oneof.
+  // Union of Channels.
   repeated Channel channels = 1;
+  // A reference to the InputGraph.
+  InputGraphRef input_graph_ref = 3;
+  // A mixture of InputSpecs.
+  Mixed mixed_inputs = 4;
+  // Static artifacts.
+  Static static_inputs = 6;
+
   // The minimum number of artifacts desired. If minimum requirement is not met,
   // the execution should not be triggered. If min_count is less than or equal
   // to 0, it means this input is optional.
   int32 min_count = 2;
+
+  // Whether the input should be hidden from the final resolved result. Only
+  // the input keys whose corresponding `InputSpec.hidden = false` will be
+  // included in the input map that is passed to the `Executor.Do`.
+  bool hidden = 5;
 }
 
 // The proto message describes specs of all inputs needed for a component
@@ -241,9 +396,24 @@ message InputSpec {
 message NodeInputs {
   // A map between the input tag and specs for the inputs of that tag.
   map<string, InputSpec> inputs = 1;
-  // Optional resolver configs. This will apply on top of the results of all
-  // inputs.
-  ResolverConfig resolver_config = 2;
+  // Deprecated. Use input_graphs and inputs.input_graph_ref instead.
+  // If resolver_config is set, then InputSpec.inputs should only contains
+  // `channels` field (not `input_graph_ref`), and both `input_graphs` and
+  // `conditionals` fields are ignored.
+  ResolverConfig resolver_config = 2 [deprecated = true];
+  // Optional InputGraphs mapping where key is an ID. Graph is referenced from
+  // InputSpec.input_graph_ref.
+  map<string, InputGraph> input_graphs = 3;
+
+  // Conditional representation.
+  message Conditional {
+    PlaceholderExpression placeholder_expression = 1;
+  }
+
+  // Optional conditionals to filter the valid inputs that satisfy the
+  // predicate. Conditional evaluation and filtering would happen after
+  // resolving all inputs from NodeInputs.inputs and NodeInputs.input_graphs.
+  map<string, Conditional> conditionals = 4;
 }
 
 // A proto message wrapping all information needed to query one set of artifacts
@@ -257,8 +427,19 @@ message OutputSpec {
     map<string, Value> additional_properties = 2;
     // Additional custom properties to set when outputting artifacts.
     map<string, Value> additional_custom_properties = 3;
+    // Predefined URI(s) that will explicitly control Artifact.uri for the ㅤ
+    // external artifacts produced by this output channel. ㅤ
+    repeated string external_artifact_uris = 4;
+    // If the artifact is an intermediate artifact. If true, then the first
+    // output artifact created by the orchestrator at the start of the
+    // component execution will be given state REFERENCE. Artifacts emitted
+    // during component execution will be given state LIVE.
+    bool is_async = 5;
   }
   ArtifactSpec artifact_spec = 1;
+
+  // Garbage collection policy of the component output channel.
+  GarbageCollectionPolicy garbage_collection_policy = 2;
 }
 
 // TODO(b/163596295): Remove this along with other usages.
@@ -354,8 +535,134 @@ message NodeExecutionOptions {
     // If set, this node will be skipped in the partial run.
     Skip skip = 3;
   }
+
+  // LINT.IfChange
+  // An enum defines the trigger strategy of when the node will be ready to be
+  // triggered. Only supported in the experimental orchestrator under SYNC mode
+  // and ignored when configured for other platforms.
+  // Note that for all trigger strategies outlined below, except
+  // LIFETIME_END_WHEN_SUBGRAPH_CANNOT_PROGRESS all upstream nodes with either
+  // task or data dependency needs to be in a final state.
+  // For LIFETIME_END_WHEN_SUBGRAPH_CANNOT_PROGRESS upstream nodes can be
+  // "unrunnable", e.g. they cannot run due to upstream failures.
+  enum TriggerStrategy {
+    // Unspecified.  Behave the same as ALL_UPSTREAM_NODES_SUCCEEDED.
+    TRIGGER_STRATEGY_UNSPECIFIED = 0;
+    // Specifies that all upstream nodes are in succeeded state.
+    ALL_UPSTREAM_NODES_SUCCEEDED = 1;
+    // Specifies that all upstream nodes are in any final state.
+    ALL_UPSTREAM_NODES_COMPLETED = 2;
+    // Specifies that all upstream nodes are in a succeeded state and that any
+    // downstream node would otherwise be able to run.
+    LAZILY_ALL_UPSTREAM_NODES_SUCCEEDED = 5;
+    // Specifies that all upstream nodes are in a final state and that any
+    // downstream node would otherwise be able to run.
+    LAZILY_ALL_UPSTREAM_NODES_COMPLETED = 4;
+    // Trigger strategy for resource lifetimes so that the end node may run
+    // when the subgraph is no longer capable of progressing. This trigger
+    // strategy requires NodeExecutionOptions.resource_lifetime.lifetime_start
+    // to be set and will error otherwise.
+    // This trigger strategy is considered experimental. Use at your own risk.
+    LIFETIME_END_WHEN_SUBGRAPH_CANNOT_PROGRESS = 6;
+    reserved 3;
+  }
+  // The trigger strategy of this node.
+  // Unset or set to default value of TRIGGER_STRATEGY_UNDEFINED behaves the
+  // same as ALL_UPSTREAM_NODES_SUCCEEDED.
+  TriggerStrategy strategy = 4;
+
+  // If set, the node's success is optional for orchestration. In other words,
+  // the node will always be treated as a succeeded node when it completes, both
+  // when triggering downstream nodes with either task or data dependency and
+  // when determining final pipeline run outcome. Only supported in the
+  // experimental orchestrator under SYNC mode and ignored when configured for
+  // other platforms.
+  bool node_success_optional = 5;
+  // LINT.ThenChange(tfx/orchestration/experimental/core/sync_pipeline_task_gen.py)
+  // Maximum number of times to retry an execution if it failed. Only supported
+  // in the internal orchestrator.
+  optional uint32 max_execution_retries = 6;
+  // Maximum time in seconds before failing an execution. Only supported
+  // in the internal orchestrator. Default to 0 which means never timeout.
+  uint32 execution_timeout_sec = 7;
+  // If False, the previous stateful working dir will be reused upon execution
+  // retries. If True, previous stateful working dir will NOT be reused.
+  bool reset_stateful_working_dir = 11;
+
+  // Fine-grained trigger configuration for the ASYNC execution mode.
+  message AsyncTrigger {
+    message InputTrigger {
+      // Trigger by new property values seen.
+      message TriggerByProperty {
+        repeated string property_keys = 1;
+      }
+      oneof type {
+        // If `True`, this input is not used for triggering.
+        bool no_trigger = 1;
+        // Trigger if new artifact property values are seen. For example if you
+        // want the component to be triggered if the new `span` arrives but skip
+        // when the new `version` of the previous span arrives, set this to
+        // `{ property_keys: ["span"] }`.
+        // Note that `properties` and `custom_properties` are not distinguished
+        // (but `properties` is higher precedence). If the property key is not
+        // found in both property dicts, it will always trigger the new
+        // execution (default behavior).
+        TriggerByProperty trigger_by_property = 2;
+        // Future candidate input triggers: Throttling(timedelta)
+      }
+    }
+
+    // Map from `input_key` to `InputTrigger`.
+    // By default (i.e. `input_key` not presents in the map), any new input
+    // artifacts (distinguished by `id`) will trigger new execution.
+    map<string, InputTrigger> input_triggers = 1;
+  }
+
+  // Async mode trigger configuration for this node.
+  AsyncTrigger async_trigger = 8;
+
+  // Configurations around a resource lifetime.
+  // Current behavior for ASYNC pipelines is undefined.
+  // TODO(b/298253165)
+  message ResourceLifetime {
+    // This is a feature to enable "end nodes" in a pipeline to
+    // support resource lifetimes. If this field is set then the node which this
+    // NodeExecutionOptions belongs to will run during pipeline finalization if
+    // the "lifetime_start" node has run succesfully.
+    // Pipeline finalization happens when:
+    // 1. All nodes in the pipeline completed, this is the "happy path".
+    // 2. A user requests for the pipeline to stop
+    // 3. A node fails in the pipeline and it cannot continue executing.
+    // This should be the id of the node "starting" a lifetime.
+    oneof paired_lifetime {
+      // If set then the node this NodeExecutionOptions belongs to marks the end
+      // of some lifetime.
+      string lifetime_start = 1;
+    }
+  }
+
+  ResourceLifetime resource_lifetime = 9;
+
+  // Which part of the component lifecycle should be applied to this component.
+  // By default there are three stages to a component lifecycle:
+  // 1. Launch (eg; job up)
+  // 2. Monitor (eg; while job_not_failed: ...)
+  // 3. Cleanup (eg; if stopped: job down)
+  enum RunMode {
+    // With DEFAULT all three stages are run.
+    DEFAULT = 0;
+    // Only the "Launch" stage is run, leaving a hanging job if no cleanup node
+    // is provided for this node.
+    // NOTE: this is intended to be used with "cleanup" nodes which are a system
+    // node that can automatically cleanup jobs produced from a LAUNCH_ONLY node
+    // by using the output artifact of the LAUNCH_ONLY node which has custom
+    // properties containing the necessary information to bring down the jobs.
+    LAUNCH_ONLY = 1;
+  }
+
+  RunMode run_mode = 10;
 }
-// Pipeline node definition.
+
 message PipelineNode {
   // Basic info of a pipeline node.
   NodeInfo node_info = 1;
@@ -400,6 +707,11 @@ message PipelineRuntimeSpec {
   // A unique id to identify a pipeline run. This will not be set during
   // compilation time but is required for synchronous pipeline execution.
   Value pipeline_run_id = 2;
+  // The id of the pipeline run for the top-level pipeline in this execution. If
+  // The top level-pipeline is ASYNC then this will be empty.
+  string top_level_pipeline_run_id = 3;
+  // URL to the Tflex frontend for this pipeline/run.
+  string frontend_url = 4;
   // Used for partial runs.
   SnapshotSettings snapshot_settings = 8;
 }
@@ -410,6 +722,21 @@ message PipelineRuntimeSpec {
 message PipelineInfo {
   // Required field. A pipeline must have an id.
   string id = 1;
+
+  // The ids of all the parent pipelines of a sub-pipeline.
+  // The order of ids represents the path from root pipeline (inclusive) to the
+  // given sub-pipeline (exclusive).
+  //
+  // For the composable pipeline example below, `parent_ids` of child-pipeline
+  // would be ["root-pipeline", "parent-pipeline"].
+  //  root-pipeline {
+  //    parent-pipeline {
+  //      child-pipeline {}
+  //    }
+  //  }
+  //
+  // Optional. Only used by sub-pipelines.
+  repeated string parent_ids = 2;
 }
 
 // Definition for a uDSL pipeline. This is also the definition of a

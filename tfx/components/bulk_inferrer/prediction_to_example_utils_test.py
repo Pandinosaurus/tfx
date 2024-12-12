@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for prediction_to_example_utils."""
 
+from absl.testing import parameterized
 import tensorflow as tf
 
 from tfx.components.bulk_inferrer import prediction_to_example_utils as utils
@@ -21,7 +22,7 @@ from google.protobuf import text_format
 from tensorflow_serving.apis import prediction_log_pb2
 
 
-class PredictionToExampleUtilsTest(tf.test.TestCase):
+class PredictionToExampleUtilsTest(tf.test.TestCase, parameterized.TestCase):
 
   def test_convert_for_multi_inference(self):
     prediction_log = text_format.Parse(
@@ -227,7 +228,11 @@ class PredictionToExampleUtilsTest(tf.test.TestCase):
     self.assertProtoEquals(expected_example,
                            utils.convert(prediction_log, output_example_spec))
 
-  def test_convert_for_predict(self):
+  @parameterized.named_parameters(
+      ('examples', 'examples'),
+      ('inputs', 'inputs'),
+  )
+  def test_convert_for_predict(self, input_key):
     example = text_format.Parse(
         """
       features {
@@ -263,14 +268,26 @@ class PredictionToExampleUtilsTest(tf.test.TestCase):
              string_val: "prediction"
            }
          }
+         outputs {
+           key: "output_ints"
+           value {
+             dtype: DT_INT64
+             tensor_shape { dim { size: 1 } dim { size: 2 }}
+             int64_val: 2
+             int64_val: 3
+           }
+         }
        }
      }
-    """ % (utils.INPUT_KEY), prediction_log_pb2.PredictionLog())
+    """
+        % input_key,
+        prediction_log_pb2.PredictionLog(),
+    )
 
     # The ending quote cannot be recognized correctly when `string_val` field
     # is directly set with a serialized string quoted in the text format.
-    prediction_log.predict_log.request.inputs[
-        utils.INPUT_KEY].string_val.append(example.SerializeToString())
+    prediction_log.predict_log.request.inputs[input_key].string_val.append(
+        example.SerializeToString())
 
     output_example_spec = text_format.Parse(
         """
@@ -284,9 +301,15 @@ class PredictionToExampleUtilsTest(tf.test.TestCase):
               output_key: 'output_bytes'
               output_column: 'predict_bytes'
             }
+            output_columns {
+              output_key: 'output_ints'
+              output_column: 'predict_ints'
+            }
           }
         }
-    """, bulk_inferrer_pb2.OutputExampleSpec())
+    """,
+        bulk_inferrer_pb2.OutputExampleSpec(),
+    )
     expected_example = text_format.Parse(
         """
         features {
@@ -302,8 +325,14 @@ class PredictionToExampleUtilsTest(tf.test.TestCase):
               key: "predict_bytes"
               value: { bytes_list: { value: "prediction" } }
             }
+            feature: {
+              key: "predict_ints"
+              value: { int64_list: { value: 2 value: 3 } }
+            }
           }
-    """, tf.train.Example())
+    """,
+        tf.train.Example(),
+    )
     self.assertProtoEquals(expected_example,
                            utils.convert(prediction_log, output_example_spec))
 
@@ -385,7 +414,11 @@ class PredictionToExampleUtilsTest(tf.test.TestCase):
     with self.assertRaises(ValueError):
       utils.convert(prediction_log, output_example_spec)
 
-  def test_convert_for_predict_invalid_output_example_spec(self):
+  @parameterized.named_parameters(
+      ('examples', 'examples'),
+      ('inputs', 'inputs'),
+  )
+  def test_convert_for_predict_invalid_output_example_spec(self, input_key):
     example = text_format.Parse(
         """
       features {
@@ -423,12 +456,12 @@ class PredictionToExampleUtilsTest(tf.test.TestCase):
          }
        }
      }
-    """ % (utils.INPUT_KEY), prediction_log_pb2.PredictionLog())
+    """ % input_key, prediction_log_pb2.PredictionLog())
 
     # The ending quote cannot be recognized correctly when `string_val` field
     # is directly set with a serialized string quoted in the text format.
-    prediction_log.predict_log.request.inputs[
-        utils.INPUT_KEY].string_val.append(example.SerializeToString())
+    prediction_log.predict_log.request.inputs[input_key].string_val.append(
+        example.SerializeToString())
 
     output_example_spec = text_format.Parse(
         """
@@ -437,7 +470,3 @@ class PredictionToExampleUtilsTest(tf.test.TestCase):
     """, bulk_inferrer_pb2.OutputExampleSpec())
     with self.assertRaises(ValueError):
       utils.convert(prediction_log, output_example_spec)
-
-
-if __name__ == '__main__':
-  tf.test.main()

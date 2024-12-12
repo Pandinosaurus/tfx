@@ -15,7 +15,6 @@
 
 import datetime
 import json
-import multiprocessing
 import os
 from typing import Any, Dict, List
 
@@ -29,6 +28,9 @@ from tfx.extensions.google_cloud_ai_platform.trainer import executor as ai_platf
 from tfx.types import standard_component_specs
 from tfx.utils import doc_controls
 from tfx.utils import json_utils
+from tfx.utils import name_utils
+
+import multiprocessing
 
 TUNING_ARGS_KEY = doc_controls.documented(
     obj='ai_platform_tuning_args',
@@ -169,13 +171,13 @@ class Executor(base_executor.BaseExecutor):
 
     # TODO(b/160059039): Factor out label creation to a utility function.
     executor_class = _WorkerExecutor
-    executor_class_path = '%s.%s' % (executor_class.__module__,
-                                     executor_class.__name__)
+    executor_class_path = name_utils.get_full_name(executor_class)
 
     # Note: exec_properties['custom_config'] here is a dict.
     return runner.start_cloud_training(input_dict, output_dict, exec_properties,
                                        executor_class_path, training_inputs,
-                                       job_id, enable_vertex, vertex_region)
+                                       job_id, None, enable_vertex,
+                                       vertex_region)
 
 
 def _need_chief_oracle(exec_properties: Dict[str, Any]) -> bool:
@@ -191,43 +193,66 @@ def _need_chief_oracle(exec_properties: Dict[str, Any]) -> bool:
 class _WorkerExecutor(base_executor.BaseExecutor):
   """TFX Tuner executor impl as a worker in a Google Cloud AI Platform job."""
 
+  def _run_chief_oracle(
+      self,
+      input_dict: Dict[str, List[types.Artifact]],
+      output_dict: Dict[str, List[types.Artifact]],
+      exec_properties: Dict[str, List[types.Artifact]],
+  ) -> None:
+    """Invoke chief oracle, and listen to the open port."""
+    logging.info('chief_oracle() starting...')
+
+    # Per KerasTuner's specification, configuration of chief oracle is set
+    # by environment variables. This only affects the current sub-process
+    # which is single-threaded, but not the main process. As such, mutation
+    # of this otherwise global state is safe.
+    os.environ['KERASTUNER_ORACLE_IP'] = '0.0.0.0'
+    os.environ['KERASTUNER_ORACLE_PORT'] = self._master_port
+    os.environ['KERASTUNER_TUNER_ID'] = 'chief'
+
+    logging.info('Binding chief oracle server at: %s:%s',
+                 os.environ['KERASTUNER_ORACLE_IP'],
+                 os.environ['KERASTUNER_ORACLE_PORT'])
+
+    # For the chief process, tuner_executor.search() starts the oracle server.
+    # The server keeps running till all trials are done.
+    tuner = tuner_executor.search(
+        input_dict=input_dict,
+        exec_properties=exec_properties,
+        working_dir=_WORKING_DIRECTORY,
+        print_tuning_summary=True)
+    tuner_executor.write_best_hyperparameters(tuner, output_dict)
+
   def _start_chief_oracle_in_subprocess(
-      self, input_dict: Dict[str, List[types.Artifact]],
-      exec_properties: Dict[str, List[types.Artifact]]):
+      self,
+      input_dict: Dict[str, List[types.Artifact]],
+      output_dict: Dict[str, List[types.Artifact]],
+      exec_properties: Dict[str, List[types.Artifact]],
+  ):
     """Starts a chief oracle in a subprocess."""
-
-    def _run_chief_oracle() -> None:
-      """Invoke chief oracle, and listen to the open port."""
-      logging.info('chief_oracle() starting...')
-
-      # Per KerasTuner's specification, configuration of chief oracle is set
-      # by environment variables. This only affects the current sub-process
-      # which is single-threaded, but not the main process. As such, mutation
-      # of this otherwise global state is safe.
-      os.environ['KERASTUNER_ORACLE_IP'] = '0.0.0.0'
-      os.environ['KERASTUNER_ORACLE_PORT'] = self._master_port
-      os.environ['KERASTUNER_TUNER_ID'] = 'chief'
-
-      logging.info('Binding chief oracle server at: %s:%s',
-                   os.environ['KERASTUNER_ORACLE_IP'],
-                   os.environ['KERASTUNER_ORACLE_PORT'])
-
-      # By design of KerasTuner, chief oracle blocks forever. Ref.
-      # https://github.com/keras-team/keras-tuner/blob/e8b0ad3ecae471c73e17cb41f37e6f99202ac0dd/kerastuner/engine/base_tuner.py#L74-L76
-      tuner_executor.search(input_dict, exec_properties, _WORKING_DIRECTORY)
-
     # Because of KerasTuner's interface whereby behavior is controlled
     # by environment variables, starting the chief oracle in a sub-process,
     # as opposed to another thread in the main process, in order not to leak
     # the environment variables.
-    result = multiprocessing.Process(target=_run_chief_oracle)
+    result = multiprocessing.Process(  # pytype: disable=attribute-error  # re-none
+        target=self._run_chief_oracle,
+        args=(
+            input_dict,
+            output_dict,
+            exec_properties,
+        ),
+    )
     result.start()
 
     logging.info('Chief oracle started at PID: %s', result.pid)
     return result
 
-  def _search(self, input_dict: Dict[str, List[types.Artifact]],
-              exec_properties: Dict[str, List[types.Artifact]]):
+  def _search(
+      self,
+      input_dict: Dict[str, List[types.Artifact]],
+      output_dict: Dict[str, List[types.Artifact]],
+      exec_properties: Dict[str, List[types.Artifact]],
+  ):
     """Conducts a single search loop, setting up chief oracle if necessary."""
 
     # If not distributed, simply conduct search and return.
@@ -244,8 +269,13 @@ class _WorkerExecutor(base_executor.BaseExecutor):
         # a subprocess and manage its lifecycle by the main process.
         # Note that the Tuner with chief oracle does not run search loop,
         # hence does not run TensorFlow code in the subprocess.
-        self._chief_process = self._start_chief_oracle_in_subprocess(
-            input_dict, exec_properties)
+        self._start_chief_oracle_in_subprocess(
+            input_dict, output_dict, exec_properties
+        )
+
+        # We started the chief in a subprocess. Now we're reusing the original
+        # process as a tuner worker to run trials.
+        self._is_chief = False
 
       # If distributed, both master and worker need to know where the oracle is.
       # Per KerasTuner's interface, it is configured through env variables.
@@ -267,8 +297,14 @@ class _WorkerExecutor(base_executor.BaseExecutor):
     logging.info('Setting KERASTUNER_TUNER_ID with %s',
                  os.environ['KERASTUNER_TUNER_ID'])
 
-    return tuner_executor.search(input_dict, exec_properties,
-                                 _WORKING_DIRECTORY)
+    # Printing tuning summary in distributed setting involves RPC calls to Chief
+    # worker. Chief worker stops after all tuning trials are finished and might
+    # be unavailable for such RPC calls.
+    return tuner_executor.search(
+        input_dict=input_dict,
+        exec_properties=exec_properties,
+        working_dir=_WORKING_DIRECTORY,
+        print_tuning_summary=False)
 
   def __init__(self, context):
     super().__init__(context)
@@ -278,8 +314,6 @@ class _WorkerExecutor(base_executor.BaseExecutor):
     self._tuner_id = None
     self._master_addr = None
     self._master_port = None
-
-    self._chief_process = None  # Populated when the chief oracle is started.
 
     # Initialize configuration of distribution according to CLUSTER_SPEC
     logging.info('Initializing cluster spec... ')
@@ -292,7 +326,8 @@ class _WorkerExecutor(base_executor.BaseExecutor):
 
     logging.info('Cluster spec initalized with: %s', cluster_spec)
 
-    # task_type can be 'master', 'worker', 'chief' or the type of wroker pool.
+    # task_type can be 'master', 'worker', 'chief' or the type of worker pool.
+    # 'workerpool0' refers to the primary replica.
     task_type = cluster_spec['task']['type']
     if 'workerpool0' in cluster_spec['cluster']:
       self._master_addr, self._master_port = (
@@ -301,7 +336,7 @@ class _WorkerExecutor(base_executor.BaseExecutor):
           # https://cloud.google.com/vertex-ai/docs/training/distributed-training#cluster-spec-format
           cluster_spec['cluster']['workerpool0'][0].split(':'))
       self._is_chief = task_type == 'workerpool0'
-    elif task_type == 'chief':
+    elif task_type == 'chief' or task_type == 'workerpool0':
       self._master_addr, self._master_port = (
           # CLUSTER_SPEC is different when only primary replica is present
           # in Vertex AI Training.
@@ -324,26 +359,14 @@ class _WorkerExecutor(base_executor.BaseExecutor):
 
     logging.info('Tuner ID is: %s', self._tuner_id)
 
-  def __del__(self):
-    self._close()
-
-  def _close(self) -> None:
-    """Kills the chief oracle sub-process, if still running."""
-    if self._chief_process and self._chief_process.is_alive():
-      logging.info('Terminating chief oracle at PID: %s',
-                   self._chief_process.pid)
-      self._chief_process.terminate()
-
   def Do(self, input_dict: Dict[str, List[types.Artifact]],
          output_dict: Dict[str, List[types.Artifact]],
          exec_properties: Dict[str, Any]) -> None:
 
-    tuner = self._search(input_dict, exec_properties)
+    tuner = self._search(input_dict, output_dict, exec_properties)
 
     if self._tuner_id is not None and not self._is_chief:
       logging.info('Returning since this is not chief worker.')
       return
 
     tuner_executor.write_best_hyperparameters(tuner, output_dict)
-
-    self._close()

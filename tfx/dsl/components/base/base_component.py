@@ -21,9 +21,11 @@ from tfx import types
 from tfx.dsl.components.base import base_driver
 from tfx.dsl.components.base import base_node
 from tfx.dsl.components.base import executor_spec
+from tfx.types import channel
 from tfx.types.system_executions import SystemExecution
 from tfx.utils import abc_utils
 from tfx.utils import doc_controls
+import typing_extensions
 
 from google.protobuf import message
 
@@ -45,6 +47,10 @@ class BaseComponent(base_node.BaseNode, abc.ABC):
     DRIVER_CLASS: a subclass of base_driver.BaseDriver as a custom driver for
       this component (optional, defaults to base_driver.BaseDriver). This is a
       class level value.
+    PRE_EXECUTABLE_SPEC: an optional PythonClassExecutableSpec of pre-execution
+      hook.
+    POST_EXECUTABLE_SPEC an optional PythonClassExecutableSpec of post-execution
+      hook.
     spec: an instance of `SPEC_CLASS`. See types.ComponentSpec for more details.
     platform_config: a protobuf message representing platform config for a
       component instance.
@@ -65,6 +71,9 @@ class BaseComponent(base_node.BaseNode, abc.ABC):
   # property as well.
   DRIVER_CLASS = base_driver.BaseDriver
   doc_controls.do_not_doc_in_subclasses(DRIVER_CLASS)
+
+  PRE_EXECUTABLE_SPEC = None
+  POST_EXECUTABLE_SPEC = None
 
   def __init__(
       self,
@@ -91,26 +100,29 @@ class BaseComponent(base_node.BaseNode, abc.ABC):
       executor_spec_obj = executor_spec_obj.copy()
     except Exception as e:  # pylint:disable = bare-except
       # This will only happen for function based components, which is fine.
-      raise ValueError(f'The executor spec of {self.__class__} class is '
-                       f'not copyable.') from e
+      raise ValueError(
+          f'The executor spec {executor_spec_obj!r} of {self.__class__} class '
+          'is not copyable.'
+      ) from e
 
     driver_class = self.__class__.DRIVER_CLASS
     # Set self.spec before super.__init__() where node registration happens.
     # This enable node input checking on node context registration.
+    self._validate_spec(spec)
+    spec.migrate_output_channels(self)
     self.spec = spec
     super().__init__(
         executor_spec=executor_spec_obj,
         driver_class=driver_class,
     )
     self._validate_component_class()
-    self._validate_spec(spec)
     self.platform_config = None
     self._pip_dependencies = []
 
   @classmethod
   def _validate_component_class(cls):
     """Validate that the SPEC_CLASSES property of this class is set properly."""
-    if not (inspect.isclass(cls.SPEC_CLASS) and
+    if not (inspect.isclass(cls.SPEC_CLASS) and  # pytype: disable=not-supported-yet
             issubclass(cls.SPEC_CLASS, types.ComponentSpec)):
       raise TypeError(
           ('Component class %s expects SPEC_CLASS property to be a subclass '
@@ -119,7 +131,7 @@ class BaseComponent(base_node.BaseNode, abc.ABC):
       raise TypeError((
           'Component class %s expects EXECUTOR_SPEC property to be an instance '
           'of ExecutorSpec; got %s instead.') % (cls, type(cls.EXECUTOR_SPEC)))
-    if not (inspect.isclass(cls.DRIVER_CLASS) and
+    if not (inspect.isclass(cls.DRIVER_CLASS) and  # pytype: disable=not-supported-yet
             issubclass(cls.DRIVER_CLASS, base_driver.BaseDriver)):
       raise TypeError(
           ('Component class %s expects DRIVER_CLASS property to be a subclass '
@@ -139,10 +151,11 @@ class BaseComponent(base_node.BaseNode, abc.ABC):
            'got %s instead.') %
           (self.__class__, self.__class__.SPEC_CLASS, spec))
 
-  # TODO(b/170682320): This function is not widely available until we migrate
-  # the entire stack to IR-based.
+  # TODO(kmonte): Update this to Self once we're on 3.11 everywhere.
   @doc_controls.do_not_doc_in_subclasses
-  def with_platform_config(self, config: message.Message) -> 'BaseComponent':
+  def with_platform_config(
+      self, config: message.Message
+  ) -> typing_extensions.Self:
     """Attaches a proto-form platform config to a component.
 
     The config will be a per-node platform-specific config.
@@ -164,11 +177,11 @@ class BaseComponent(base_node.BaseNode, abc.ABC):
 
   @property
   @doc_controls.do_not_doc_in_subclasses
-  def inputs(self) -> Dict[str, Any]:
+  def inputs(self) -> Dict[str, channel.Channel]:
     return self.spec.inputs
 
   @property
-  def outputs(self) -> Dict[str, Any]:
+  def outputs(self) -> Dict[str, channel.OutputChannel]:
     """Component's output channel dict."""
     return self.spec.outputs
 

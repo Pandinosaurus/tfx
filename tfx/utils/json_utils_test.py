@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for tfx.utils.json_utils."""
 
+
 import tensorflow as tf
 from tfx.proto import trainer_pb2
 from tfx.utils import deprecation_utils
@@ -39,6 +40,14 @@ class JsonUtilsTest(tf.test.TestCase):
     obj = _DefaultJsonableObject(1, {'a': 'b'}, [True])
 
     json_text = json_utils.dumps(obj)
+    self.assertEqual(
+        (
+            '{"__class__": "_DefaultJsonableObject", "__module__": "tfx.utils.json_utils_test",'
+            ' "__tfx_object_type__": "jsonable", "a": 1, "b": {"a": "b"}, "c":'
+            ' [true]}'
+        ),
+        json_text,
+    )
 
     actual_obj = json_utils.loads(json_text)
     self.assertEqual(1, actual_obj.a)
@@ -51,6 +60,18 @@ class JsonUtilsTest(tf.test.TestCase):
     obj = _DefaultJsonableObject(nested_obj, None, None)
 
     json_text = json_utils.dumps(obj)
+    self.assertEqual(
+        (
+            '{"__class__": "_DefaultJsonableObject", "__module__": "tfx.utils.json_utils_test",'
+            ' "__tfx_object_type__": "jsonable", "a": {"__class__":'
+            ' "_DefaultJsonableObject", "__module__": "tfx.utils.json_utils_test",'
+            ' "__tfx_object_type__": "jsonable", "a": 1, "b": 2, "c":'
+            ' {"__class__": "TrainArgs", "__module__": "tfx.proto.trainer_pb2",'
+            ' "__proto_value__": "{\\n  \\"num_steps\\": 100\\n}",'
+            ' "__tfx_object_type__": "proto"}}, "b": null, "c": null}'
+        ),
+        json_text,
+    )
 
     actual_obj = json_utils.loads(json_text)
     self.assertEqual(1, actual_obj.a.a)
@@ -63,6 +84,15 @@ class JsonUtilsTest(tf.test.TestCase):
     obj = _DefaultJsonableObject(_DefaultJsonableObject, None, None)
 
     json_text = json_utils.dumps(obj)
+    self.assertEqual(
+        (
+            '{"__class__": "_DefaultJsonableObject", "__module__": "tfx.utils.json_utils_test",'
+            ' "__tfx_object_type__": "jsonable", "a": {"__class__":'
+            ' "_DefaultJsonableObject", "__module__": "tfx.utils.json_utils_test",'
+            ' "__tfx_object_type__": "class"}, "b": null, "c": null}'
+        ),
+        json_text,
+    )
 
     actual_obj = json_utils.loads(json_text)
     self.assertEqual(_DefaultJsonableObject, actual_obj.a)
@@ -71,16 +101,26 @@ class JsonUtilsTest(tf.test.TestCase):
 
   def testDumpsClass(self):
     json_text = json_utils.dumps(_DefaultJsonableObject)
+    self.assertEqual(
+        (
+            '{"__class__": "_DefaultJsonableObject", "__module__": "tfx.utils.json_utils_test",'
+            ' "__tfx_object_type__": "class"}'
+        ),
+        json_text,
+    )
 
     actual_obj = json_utils.loads(json_text)
     self.assertEqual(_DefaultJsonableObject, actual_obj)
 
   def testDumpsDeprecatedClass(self):
     json_text = json_utils.dumps(_DeprecatedAlias)
+    self.assertEqual(
+        (
+            '{"__class__": "_DefaultJsonableObject", "__module__": "tfx.utils.json_utils_test",'
+            ' "__tfx_object_type__": "class"}'
+        ),
+        json_text,
+    )
 
     actual_obj = json_utils.loads(json_text)
     self.assertEqual(_DefaultJsonableObject, actual_obj)
-
-
-if __name__ == '__main__':
-  tf.test.main()

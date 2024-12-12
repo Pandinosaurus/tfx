@@ -14,7 +14,7 @@
 """Builder for Kubeflow pipelines StepSpec proto."""
 
 import itertools
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from absl import logging
 from kfp.pipeline_spec import pipeline_spec_pb2 as pipeline_pb2
@@ -28,17 +28,23 @@ from tfx.dsl.components.base import base_node
 from tfx.dsl.components.base import executor_spec
 from tfx.dsl.components.common import importer
 from tfx.dsl.components.common import resolver
+from tfx.dsl.context_managers import dsl_context_registry
 from tfx.dsl.experimental.conditionals import conditional
 from tfx.dsl.input_resolution.strategies import latest_artifact_strategy
 from tfx.dsl.input_resolution.strategies import latest_blessed_model_strategy
+from tfx.dsl.placeholder import placeholder
 from tfx.orchestration import data_types
+from tfx.orchestration.kubeflow import decorators
+from tfx.orchestration.kubeflow import utils
 from tfx.orchestration.kubeflow.v2 import compiler_utils
-from tfx.orchestration.kubeflow.v2 import decorators
 from tfx.orchestration.kubeflow.v2 import parameter_utils
+from tfx.types import channel_utils
 from tfx.types import standard_artifacts
 from tfx.types.channel import Channel
 from tfx.utils import deprecation_utils
+from tfx.utils import name_utils
 
+from google.protobuf import json_format
 from ml_metadata.proto import metadata_store_pb2
 
 _EXECUTOR_LABEL_PATTERN = '{}_executor'
@@ -127,18 +133,22 @@ class StepBuilder:
   augments the deployment config associated with the node.
   """
 
-  def __init__(self,
-               node: base_node.BaseNode,
-               deployment_config: pipeline_pb2.PipelineDeploymentConfig,
-               component_defs: Dict[str, pipeline_pb2.ComponentSpec],
-               image: Optional[str] = None,
-               image_cmds: Optional[List[str]] = None,
-               beam_pipeline_args: Optional[List[str]] = None,
-               enable_cache: bool = False,
-               pipeline_info: Optional[data_types.PipelineInfo] = None,
-               channel_redirect_map: Optional[Dict[Tuple[str, str],
-                                                   str]] = None,
-               is_exit_handler: bool = False):
+  def __init__(
+      self,
+      node: base_node.BaseNode,
+      deployment_config: pipeline_pb2.PipelineDeploymentConfig,
+      component_defs: Dict[str, pipeline_pb2.ComponentSpec],
+      dsl_context_reg: dsl_context_registry.DslContextRegistry,
+      dynamic_exec_properties: Optional[Dict[Tuple[str, str], str]] = None,
+      image: Optional[str] = None,
+      image_cmds: Optional[List[str]] = None,
+      beam_pipeline_args: Optional[List[str]] = None,
+      enable_cache: bool = False,
+      pipeline_info: Optional[data_types.PipelineInfo] = None,
+      channel_redirect_map: Optional[Dict[Tuple[str, str], str]] = None,
+      is_exit_handler: bool = False,
+      use_pipeline_spec_2_1: bool = False,
+  ):
     """Creates a StepBuilder object.
 
     A StepBuilder takes in a TFX node object (usually it's a component/resolver/
@@ -147,21 +157,25 @@ class StepBuilder:
 
     Args:
       node: A TFX node. The logical unit of a step. Note, currently for resolver
-        node we only support two types of resolver
-        policies, including: 1) latest blessed model, and 2) latest model
-          artifact.
+        node we only support two types of resolver policies, including: 1)
+        latest blessed model, and 2) latest model artifact.
       deployment_config: The deployment config in Kubeflow IR to be populated.
       component_defs: Dict mapping from node id to compiled ComponetSpec proto.
         Items in the dict will get updated as the pipeline is built.
+      dsl_context_reg: A DslContextRegistry instance from
+        Pipeline.dsl_context_registry.
+      dynamic_exec_properties: A dictionary mapping upstream component output
+        names to types used to resolve Placeholder authoring in downstream
+        components.
       image: TFX image used in the underlying container spec. Required if node
         is a TFX component.
-      image_cmds: Optional. If not specified the default `ENTRYPOINT` defined
-        in the docker image will be used. Note: the commands here refers to the
-          K8S container command, which maps to Docker entrypoint field. If one
-          supplies command but no args are provided for the container, the
-          container will be invoked with the provided command, ignoring the
-          `ENTRYPOINT` and `CMD` defined in the Dockerfile. One can find more
-          details regarding the difference between K8S and Docker conventions at
+      image_cmds: Optional. If not specified the default `ENTRYPOINT` defined in
+        the docker image will be used. Note: the commands here refers to the K8S
+        container command, which maps to Docker entrypoint field. If one
+        supplies command but no args are provided for the container, the
+        container will be invoked with the provided command, ignoring the
+        `ENTRYPOINT` and `CMD` defined in the Dockerfile. One can find more
+        details regarding the difference between K8S and Docker conventions at
         https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/#notes
       beam_pipeline_args: Pipeline arguments for Beam powered Components.
       enable_cache: If true, enables cache lookup for this pipeline step.
@@ -174,6 +188,8 @@ class StepBuilder:
         DSL node is splitted into multiple tasks in pipeline API proto. For
         example, latest blessed model resolver.
       is_exit_handler: Marking whether the task is for exit handler.
+      use_pipeline_spec_2_1: Use the KFP pipeline spec schema 2.1 to support
+        Vertex ML pipeline teamplate gallary.
 
     Raises:
       ValueError: On the following two cases:
@@ -186,10 +202,23 @@ class StepBuilder:
     self._node = node
     self._deployment_config = deployment_config
     self._component_defs = component_defs
+    self._dynamic_exec_properties = dynamic_exec_properties
+    self._dsl_context_registry = dsl_context_reg
     self._inputs = node.inputs
     self._outputs = node.outputs
     self._enable_cache = enable_cache
     self._is_exit_handler = is_exit_handler
+    self._use_pipeline_spec_2_1 = use_pipeline_spec_2_1
+    if use_pipeline_spec_2_1:
+      self._build_parameter_type_spec_func = (
+          compiler_utils.build_parameter_type_spec
+      )
+      self._value_converter_func = compiler_utils.value_converter
+    else:
+      self._build_parameter_type_spec_func = (
+          compiler_utils.build_parameter_type_spec_legacy
+      )
+      self._value_converter_func = compiler_utils.value_converter_legacy
     if channel_redirect_map is None:
       self._channel_redirect_map = {}
     else:
@@ -254,7 +283,8 @@ class StepBuilder:
     # Conditionals
     implicit_input_channels = {}
     implicit_upstream_node_ids = set()
-    predicates = conditional.get_predicates(self._node)
+    predicates = conditional.get_predicates(self._node,
+                                            self._dsl_context_registry)
     if predicates:
       implicit_keys_map = {
           tfx_compiler_utils.implicit_channel_key(channel): key
@@ -262,15 +292,17 @@ class StepBuilder:
       }
       cel_predicates = []
       for predicate in predicates:
-        for channel in predicate.dependent_channels():
+        for channel in channel_utils.get_dependent_channels(predicate):
           implicit_key = tfx_compiler_utils.implicit_channel_key(channel)
           if implicit_key not in implicit_keys_map:
             # Store this channel and add it to the node inputs later.
             implicit_input_channels[implicit_key] = channel
             # Store the producer node and add it to the upstream nodes later.
             implicit_upstream_node_ids.add(channel.producer_component_id)
-        placeholder_pb = predicate.encode_with_keys(
-            tfx_compiler_utils.build_channel_to_key_fn(implicit_keys_map))
+        placeholder_pb = channel_utils.encode_placeholder_with_channels(
+            predicate,
+            tfx_compiler_utils.build_channel_to_key_fn(implicit_keys_map),
+        )
         cel_predicates.append(compiler_utils.placeholder_to_cel(placeholder_pb))
       task_spec.trigger_policy.condition = ' && '.join(cel_predicates)
 
@@ -290,33 +322,52 @@ class StepBuilder:
           output_channel)
       component_def.output_definitions.artifacts[name].CopyFrom(
           output_artifact_spec)
+
+      # If output artifact is passed to downstream components as param, emit
+      # an output param.
+      key = (self._node.id, name)
+      if self._dynamic_exec_properties and key in self._dynamic_exec_properties:
+        output_parameter_spec = compiler_utils.build_output_parameter_spec(
+            self._dynamic_exec_properties[key])
+        component_def.output_definitions.parameters[name].CopyFrom(
+            output_parameter_spec)
+
     # Exec properties
     for name, value in self._exec_properties.items():
       # value can be None for unprovided optional exec properties.
       if value is None:
         continue
-      parameter_type_spec = compiler_utils.build_parameter_type_spec(value)
+
+      parameter_type_spec = self._build_parameter_type_spec_func(value)
       component_def.input_definitions.parameters[name].CopyFrom(
-          parameter_type_spec)
+          parameter_type_spec
+      )
     if self._name not in self._component_defs:
       self._component_defs[self._name] = component_def
     else:
-      raise ValueError(f'Found duplicate component ids {self._name} while '
-                       'building component definitions.')
+      raise ValueError(
+          f'Found duplicate component ids {self._name} while '
+          'building component definitions.'
+      )
 
     # 3. Build task spec.
     task_spec.task_info.name = self._name
-    dependency_ids = sorted({node.id for node in self._node.upstream_nodes}
-                            | implicit_upstream_node_ids)
+    dependency_ids = sorted(
+        {node.id for node in self._node.upstream_nodes}
+        | implicit_upstream_node_ids
+    )
 
-    for name, input_channel in itertools.chain(self._inputs.items(),
-                                               implicit_input_channels.items()):
+    for name, input_channel in itertools.chain(
+        self._inputs.items(), implicit_input_channels.items()
+    ):
       # TODO(b/169573945): Add support for vertex if requested.
       if not isinstance(input_channel, Channel):
         raise TypeError('Only single Channel is supported.')
       if self._is_exit_handler:
-        logging.error('exit handler component doesn\'t take input artifact, '
-                      'the input will be ignored.')
+        logging.error(
+            "exit handler component doesn't take input artifact, "
+            'the input will be ignored.'
+        )
         continue
       # If the redirecting map is provided (usually for latest blessed model
       # resolver, we'll need to redirect accordingly. Also, the upstream node
@@ -331,14 +382,31 @@ class StepBuilder:
                                                    (producer_id, output_key))[0]
       output_key = self._channel_redirect_map.get((producer_id, output_key),
                                                   (producer_id, output_key))[1]
+
       input_artifact_spec = pipeline_pb2.TaskInputsSpec.InputArtifactSpec()
       input_artifact_spec.task_output_artifact.producer_task = producer_id
       input_artifact_spec.task_output_artifact.output_artifact_key = output_key
       task_spec.inputs.artifacts[name].CopyFrom(input_artifact_spec)
+
     for name, value in self._exec_properties.items():
       if value is None:
         continue
-      if isinstance(value, data_types.RuntimeParameter):
+      if isinstance(value, placeholder.Placeholder):
+        try:
+          # This unwraps channel.future()[0].value and disallows any other
+          # placeholder expressions.
+          channel = channel_utils.unwrap_simple_channel_placeholder(value)
+        except ValueError as e:
+          raise ValueError(f'Invalid placeholder for exec prop {name}') from e
+        task_spec.inputs.parameters[name].CopyFrom(
+            pipeline_pb2.TaskInputsSpec.InputParameterSpec(
+                task_output_parameter=pipeline_pb2.TaskInputsSpec.InputParameterSpec.TaskOutputParameterSpec(
+                    producer_task=channel.producer_component_id + '_task',
+                    output_parameter_key=channel.output_key,
+                )
+            )
+        )
+      elif isinstance(value, data_types.RuntimeParameter):
         parameter_utils.attach_parameter(value)
         task_spec.inputs.parameters[name].component_input_parameter = value.name
       elif isinstance(value, decorators.FinalStatusStr):
@@ -347,14 +415,14 @@ class StepBuilder:
                         ' handler. The parameter is ignored.')
         else:
           task_spec.inputs.parameters[name].task_final_status.producer_task = (
-              compiler_utils.TFX_DAG_NAME)
+              utils.TFX_DAG_NAME)
       else:
         task_spec.inputs.parameters[name].CopyFrom(
             pipeline_pb2.TaskInputsSpec.InputParameterSpec(
-                runtime_value=compiler_utils.value_converter(value)))
-
+                runtime_value=self._value_converter_func(value)
+            )
+        )
     task_spec.component_ref.name = self._name
-
     dependency_ids = sorted(dependency_ids)
     for dependency in dependency_ids:
       task_spec.dependent_tasks.append(dependency)
@@ -368,8 +436,7 @@ class StepBuilder:
       task_spec.trigger_policy.strategy = (
           pipeline_pb2.PipelineTaskSpec.TriggerPolicy
           .ALL_UPSTREAM_TASKS_COMPLETED)
-      task_spec.dependent_tasks.append(compiler_utils.TFX_DAG_NAME)
-
+      task_spec.dependent_tasks.append(utils.TFX_DAG_NAME)
     # 4. Build the executor body for other common tasks.
     executor = pipeline_pb2.PipelineDeploymentConfig.ExecutorSpec()
     if isinstance(self._node, importer.Importer):
@@ -378,11 +445,10 @@ class StepBuilder:
       executor.container.CopyFrom(self._build_file_based_example_gen_spec())
     elif isinstance(self._node, (components.InfraValidator)):
       raise NotImplementedError(
-          'The componet type "{}" is not supported'.format(type(self._node)))
+          'The component type "{}" is not supported'.format(type(self._node)))
     else:
       executor.container.CopyFrom(self._build_container_spec())
     self._deployment_config.executors[executor_label].CopyFrom(executor)
-
     return {self._name: task_spec}
 
   def _build_container_spec(self) -> ContainerSpec:
@@ -396,7 +462,29 @@ class StepBuilder:
       NotImplementedError: When the executor class is neither ExecutorClassSpec
       nor TemplatedExecutorContainerSpec.
     """
+
     assert isinstance(self._node, base_component.BaseComponent)
+
+    if self._node.platform_config:
+      logging.info(
+          'ResourceSpec with container execution parameters has been passed via platform_config'
+      )
+      assert isinstance(
+          self._node.platform_config, pipeline_pb2.PipelineDeploymentConfig
+          .PipelineContainerSpec.ResourceSpec
+      ), ('platform_config, if set by the user, must be a ResourceSpec proto '
+          'specifying vCPU and vRAM requirements')
+      cpu_limit = self._node.platform_config.cpu_limit
+      memory_limit = self._node.platform_config.memory_limit
+      if cpu_limit:
+        assert (cpu_limit >= 0), ('vCPU must be non-negative')
+      if memory_limit:
+        assert (memory_limit >= 0), ('vRAM must be non-negative')
+
+      if self._node.platform_config.accelerator.type:
+        assert (self._node.platform_config.accelerator.count >=
+                0), ('GPU type and count must be set')
+
     if isinstance(self._node.executor_spec,
                   executor_specs.TemplatedExecutorContainerSpec):
       container_spec = self._node.executor_spec
@@ -405,8 +493,9 @@ class StepBuilder:
           command=_resolve_command_line(
               container_spec=container_spec,
               exec_properties=self._node.exec_properties,
-          ),
-      )
+          ))
+      if self._node.platform_config:
+        result.resources.CopyFrom(self._node.platform_config)
       return result
 
     # The container entrypoint format below assumes ExecutorClassSpec.
@@ -421,16 +510,26 @@ class StepBuilder:
     if self._image_cmds:
       for cmd in self._image_cmds:
         result.command.append(cmd)
-    executor_path = '%s.%s' % (
-        self._node.executor_spec.executor_class.__module__,
-        self._node.executor_spec.executor_class.__name__)
+    executor_path = name_utils.get_full_name(
+        self._node.executor_spec.executor_class)
     # Resolve container arguments.
     result.args.append('--executor_class_path')
     result.args.append(executor_path)
     result.args.append('--json_serialized_invocation_args')
+    # from kfp dsl: PIPELINE_TASK_EXECUTOR_INPUT_PLACEHOLDER
     result.args.append('{{$}}')
+
+    if self._use_pipeline_spec_2_1:
+      result.args.append('--json_serialized_inputs_spec_args')
+      result.args.append(
+          json_format.MessageToJson(
+              self._component_defs[self._name].input_definitions, sort_keys=True
+          )
+      )
     result.args.extend(self._beam_pipeline_args)
 
+    if self._node.platform_config:
+      result.resources.CopyFrom(self._node.platform_config)
     return result
 
   def _build_file_based_example_gen_spec(self) -> ContainerSpec:
@@ -458,7 +557,17 @@ class StepBuilder:
             args=[
                 '--json_serialized_invocation_args',
                 '{{$}}',
-            ]))
+            ],
+        )
+    )
+    if self._use_pipeline_spec_2_1:
+      driver_hook.pre_cache_check.args.extend([
+          '--json_serialized_inputs_spec_args',
+          json_format.MessageToJson(
+              self._component_defs[self._name].input_definitions,
+              sort_keys=True,
+          ),
+      ])
     driver_hook.pre_cache_check.args.extend(self._beam_pipeline_args)
     result.lifecycle.CopyFrom(driver_hook)
 
@@ -468,21 +577,28 @@ class StepBuilder:
     if self._image_cmds:
       for cmd in self._image_cmds:
         result.command.append(cmd)
-    executor_path = '%s.%s' % (
-        self._node.executor_spec.executor_class.__module__,
-        self._node.executor_spec.executor_class.__name__)
+    executor_path = name_utils.get_full_name(
+        self._node.executor_spec.executor_class)
     # Resolve container arguments.
     result.args.append('--executor_class_path')
     result.args.append(executor_path)
     result.args.append('--json_serialized_invocation_args')
     result.args.append('{{$}}')
+    if self._use_pipeline_spec_2_1:
+      result.args.append('--json_serialized_inputs_spec_args')
+      result.args.append(
+          json_format.MessageToJson(
+              self._component_defs[self._name].input_definitions, sort_keys=True
+          )
+      )
     result.args.extend(self._beam_pipeline_args)
     return result
 
   def _build_importer_spec(self) -> ImporterSpec:
     """Builds ImporterSpec."""
     assert isinstance(self._node, importer.Importer)
-    output_channel = self._node.outputs[importer.IMPORT_RESULT_KEY]
+    output_key = cast(str, self._exec_properties[importer.OUTPUT_KEY_KEY])
+    output_channel = self._node.outputs[output_key]
     result = ImporterSpec()
 
     # Importer's output channel contains one artifact instance with
@@ -505,8 +621,10 @@ class StepBuilder:
       result.artifact_uri.runtime_parameter = importer.SOURCE_URI_KEY
     else:
       result.artifact_uri.CopyFrom(
-          compiler_utils.value_converter(
-              self._exec_properties[importer.SOURCE_URI_KEY]))
+          self._value_converter_func(
+              self._exec_properties[importer.SOURCE_URI_KEY]
+          )
+      )
 
     result.type_schema.CopyFrom(
         pipeline_pb2.ArtifactTypeSchema(
@@ -549,7 +667,7 @@ class StepBuilder:
     for name, value in self._exec_properties.items():
       if value is None:
         continue
-      parameter_type_spec = compiler_utils.build_parameter_type_spec(value)
+      parameter_type_spec = self._build_parameter_type_spec_func(value)
       component_def.input_definitions.parameters[name].CopyFrom(
           parameter_type_spec)
       if isinstance(value, data_types.RuntimeParameter):
@@ -558,7 +676,9 @@ class StepBuilder:
       else:
         task_spec.inputs.parameters[name].CopyFrom(
             pipeline_pb2.TaskInputsSpec.InputParameterSpec(
-                runtime_value=compiler_utils.value_converter(value)))
+                runtime_value=self._value_converter_func(value)
+            )
+        )
     self._component_defs[self._name] = component_def
     task_spec.component_ref.name = self._name
 

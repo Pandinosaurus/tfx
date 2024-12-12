@@ -80,11 +80,11 @@ _BEAM_EXTRA_PACKAGE_PREFIX = '--extra_package='
 
 # Stats output filename keys.
 _ANOMALIES_FILE = 'SchemaDiff.pb'
-_STATS_FILE = 'FeatureStats.pb'
+STATS_FILE = 'FeatureStats.pb'
 SAMPLE_FILE_NAME = 'Sample.rio'
 # TODO(b/215448985): Move these to a shared location with StatsGen.
 _SHARDED_OUTPUT_PARTITIONS = 10
-_SHARDED_STATS_PREFIX = 'FeatureStats.rio'
+SHARDED_STATS_PREFIX = 'FeatureStats.rio'
 
 _SCHEMA_FILE = 'schema.pbtxt'
 
@@ -92,6 +92,9 @@ _ANOMALIES_KEY = 'anomalies'
 _SCHEMA_KEY = 'schema'
 _STATS_KEY = 'stats'
 _SHARDED_STATS_KEY = 'sharded_stats'
+
+_FILE_FORMAT_PARQUET = example_gen_pb2.FileFormat.Name(
+    example_gen_pb2.FileFormat.FILE_FORMAT_PARQUET)
 
 
 # TODO(b/122478841): Move it to a common place that is shared across components.
@@ -225,6 +228,10 @@ class _Dataset:
   def index(self, val):
     self._index = val
 
+  @dataset_key.setter
+  def dataset_key(self, val):
+    self._dataset_key = val
+
   @standardized.setter
   def standardized(self, val):
     self._standardized = val
@@ -271,6 +278,7 @@ def _InvokeStatsOptionsUpdaterFn(
                               tf.saved_model.ASSETS_DIRECTORY)
     vocab_paths = {k: os.path.join(asset_path, v) for k, v in asset_map.items()}
     options['vocab_paths'] = vocab_paths
+  options['experimental_use_sketch_based_topk_uniques'] = True
   return stats_options_updater_fn(stats_type, tfdv.StatsOptions(**options))
 
 
@@ -290,6 +298,44 @@ def _FilterInternalColumn(
     filtered_columns.pop(internal_column_index)
     filtered_schema = record_batch.schema.remove(internal_column_index)
     return pa.RecordBatch.from_arrays(filtered_columns, schema=filtered_schema)
+
+
+def _GetCacheableDatasetsCount(num_analyzers: int, stats_enabled: bool) -> int:
+  """Returns the number of datasests which should be cached based on heuristic.
+
+  We allow pipelines with a small amount of analyzers (0-50) to cache many
+  datasets, and restrict it further as the number of analyzers increases, so
+  that a pipeline which has hundreds of analyzers can only cache a few datasets.
+  If a pipeline does not enable statistics generation then we estimate that it
+  can cache double the amount of datasets since it will have a smaller graph
+  representation. See go/tft-incremental-cache-design.
+
+  Args:
+    num_analyzers: The number of cacheable analyzers in the TFT pipeline.
+    stats_enabled: Whether or not pre/post transform statistics are enabled in
+      this pipeline.
+
+  Returns:
+    The number of datasets that this pipeline should compute cache for.
+  """
+  result = 0
+  if num_analyzers <= 10:
+    result = 100
+  elif num_analyzers <= 50:
+    result = 50
+  elif num_analyzers <= 100:
+    result = 10
+  elif num_analyzers <= 150:
+    result = 6
+  elif num_analyzers <= 200:
+    result = 4
+  elif num_analyzers <= 300:
+    result = 2
+  else:
+    result = 1
+  if not stats_enabled:
+    result = result * 2
+  return result
 
 
 class Executor(base_beam_executor.BaseBeamExecutor):
@@ -424,6 +470,7 @@ class Executor(base_beam_executor.BaseBeamExecutor):
           all splits. If splits_config is set, analyze cannot be empty.
         - force_tf_compat_v1: Whether to use TF in compat.v1 mode
           irrespective of installed/enabled TF behaviors.
+        - save_options: An optional tf.saved_model.SaveOptions object.
         - disable_statistics: Whether to disable computation of pre-transform
           and post-transform statistics.
 
@@ -475,49 +522,59 @@ class Executor(base_beam_executor.BaseBeamExecutor):
     transform_file_formats = []
     for split in splits_config.transform:
       data_uris = artifact_utils.get_split_uris(
-          input_dict[standard_component_specs.EXAMPLES_KEY], split)
+          input_dict[standard_component_specs.EXAMPLES_KEY], split
+      )
       assert len(data_uris) == len(
-          examples_file_formats), 'Length of file formats is different'
+          examples_file_formats
+      ), 'Length of file formats is different'
       for data_uri, file_format in zip(data_uris, examples_file_formats):
         transform_data_paths.append(io_utils.all_files_pattern(data_uri))
         transform_file_formats.append(file_format)
 
     transformed_examples = output_dict.get(
-        standard_component_specs.TRANSFORMED_EXAMPLES_KEY)
+        standard_component_specs.TRANSFORMED_EXAMPLES_KEY
+    )
     executor_utils.SetSplitNames(splits_config.transform, transformed_examples)
     materialize_output_paths = executor_utils.GetSplitPaths(
-        transformed_examples)
+        transformed_examples
+    )
 
     force_tf_compat_v1 = bool(
-        exec_properties.get(standard_component_specs.FORCE_TF_COMPAT_V1_KEY, 0))
+        exec_properties.get(standard_component_specs.FORCE_TF_COMPAT_V1_KEY, 0)
+    )
+
+    save_options = exec_properties.get(
+        standard_component_specs.SAVE_OPTIONS_KEY, None
+    )
 
     # Make sure user packages get propagated to the remote Beam worker.
     user_module_key = exec_properties.get(
-        standard_component_specs.MODULE_PATH_KEY, None)
+        standard_component_specs.MODULE_PATH_KEY, None
+    )
     _, extra_pip_packages = udf_utils.decode_user_module_key(user_module_key)
     for pip_package_path in extra_pip_packages:
       local_pip_package_path = io_utils.ensure_local(pip_package_path)
-      self._beam_pipeline_args.append(_BEAM_EXTRA_PACKAGE_PREFIX +
-                                      local_pip_package_path)
+      self._beam_pipeline_args.append(
+          _BEAM_EXTRA_PACKAGE_PREFIX + local_pip_package_path
+      )
       self._pip_dependencies.append(local_pip_package_path)
 
     inputs_for_fn_resolution = {
-        labels.MODULE_FILE:
-            exec_properties.get(standard_component_specs.MODULE_FILE_KEY, None),
-        labels.MODULE_PATH:
-            user_module_key,
-        labels.PREPROCESSING_FN:
-            exec_properties.get(standard_component_specs.PREPROCESSING_FN_KEY,
-                                None),
-        labels.STATS_OPTIONS_UPDATER_FN:
-            exec_properties.get(
-                standard_component_specs.STATS_OPTIONS_UPDATER_FN_KEY, None),
-        labels.CUSTOM_CONFIG:
-            exec_properties.get(standard_component_specs.CUSTOM_CONFIG_KEY,
-                                None),
+        labels.MODULE_FILE: exec_properties.get(
+            standard_component_specs.MODULE_FILE_KEY, None
+        ),
+        labels.MODULE_PATH: user_module_key,
+        labels.PREPROCESSING_FN: exec_properties.get(
+            standard_component_specs.PREPROCESSING_FN_KEY, None
+        ),
+        labels.STATS_OPTIONS_UPDATER_FN: exec_properties.get(
+            standard_component_specs.STATS_OPTIONS_UPDATER_FN_KEY, None
+        ),
+        labels.CUSTOM_CONFIG: exec_properties.get(
+            standard_component_specs.CUSTOM_CONFIG_KEY, None
+        ),
         # Used in nitroml/automl/autodata/transform/executor.py
-        labels.SCHEMA_PATH_LABEL:
-            schema_file,
+        labels.SCHEMA_PATH_LABEL: schema_file,
     }
     # Used in nitroml/automl/autodata/transform/executor.py
     outputs_for_fn_resolution = {
@@ -555,6 +612,8 @@ class Executor(base_beam_executor.BaseBeamExecutor):
             self._make_beam_pipeline,
         labels.FORCE_TF_COMPAT_V1_LABEL:
             force_tf_compat_v1,
+        labels.SAVE_OPTIONS_LABEL:
+            save_options,
         **executor_utils.GetCachePathEntry(
             standard_component_specs.ANALYZER_CACHE_KEY, input_dict)
     }
@@ -590,13 +649,13 @@ class TransformProcessor:
   @staticmethod
   @beam.ptransform_fn
   @beam.typehints.with_input_types(beam.Pipeline)
-  @beam.typehints.with_output_types(beam.pvalue.PDone)
   def _IncrementPipelineMetrics(
       pipeline: beam.Pipeline, total_columns_count: int,
       analyze_columns_count: int, transform_columns_count: int,
       analyze_paths_count: int, analyzer_cache_enabled: bool,
       disable_statistics: bool, materialize: bool,
-      estimated_stage_count_with_cache: int):
+      estimated_stage_count_with_cache: int,
+      cached_datasets: int):
     """A beam PTransform to increment counters of column usage."""
 
     def _MakeAndIncrementCounters(unused_element):
@@ -627,6 +686,9 @@ class TransformProcessor:
           tft_beam.common.METRICS_NAMESPACE,
           'estimated_stage_count_with_cache').update(
               estimated_stage_count_with_cache)
+      beam.metrics.Metrics.counter(
+          tft_beam.common.METRICS_NAMESPACE, 'cached_datasets'
+          ).inc(cached_datasets)
       return beam.pvalue.PDone(pipeline)
 
     return (
@@ -634,30 +696,46 @@ class TransformProcessor:
         | 'CreateSole' >> beam.Create([None])
         | 'Count' >> beam.Map(_MakeAndIncrementCounters))
 
+  # TODO(b/139538871): Implement telemetry, on top of pa.Table once available.
   @staticmethod
   @beam.ptransform_fn
-  @beam.typehints.with_input_types(Tuple[Optional[bytes], bytes])
-  @beam.typehints.with_output_types(beam.pvalue.PDone)
-  def _WriteExamples(pcoll: beam.pvalue.PCollection, file_format: str,
-                     transformed_example_path: str) -> beam.pvalue.PDone:
-    """Writes transformed examples compressed in gzip format.
+  @beam.typehints.with_input_types(Tuple[pa.RecordBatch, Dict[str, pa.Array]])
+  def _EncodeAndWrite(pcoll: beam.PCollection, schema: schema_pb2.Schema,
+                      file_format: str, output_path: str) -> beam.pvalue.PDone:
+    """Encodes and writes transformed RecordBatches in the given file format.
 
     Args:
-      pcoll: PCollection of serialized transformed examples.
+      pcoll: PCollection of transformed RecordBatches and unary pass-through
+        features.
+      schema: TFMD schema for the transformed data.
       file_format: The output file format.
-      transformed_example_path: path to write to.
+      output_path: Path that will serve as a prefix for the produced files.
 
     Returns:
       beam.pvalue.PDone.
     """
-    assert file_format == labels.FORMAT_TFRECORD, file_format
-
-    # TODO(b/139538871): Implement telemetry, on top of pa.Table once available.
-    return (
-        pcoll
-        | 'Values' >> beam.Values()
-        | 'Write' >> beam.io.WriteToTFRecord(
-            transformed_example_path, file_name_suffix='.gz'))
+    if file_format == labels.FORMAT_TFRECORD:
+      return (pcoll
+              | 'EncodeAndSerialize' >> beam.ParDo(
+                  TransformProcessor._RecordBatchToExamplesFn(schema))
+              | 'ExtractExamples' >> beam.Values()
+              | 'WriteToTFRecord' >> beam.io.WriteToTFRecord(
+                  output_path, file_name_suffix='.gz'))
+    elif file_format == _FILE_FORMAT_PARQUET:
+      arrow_schema = (
+          impl_helper.make_tensor_to_arrow_converter(schema).arrow_schema())
+      return (pcoll | 'ExtractRecordBatches' >> beam.Keys()
+              | 'ToRecords' >>
+              beam.FlatMap(lambda x: x.to_pandas().to_dict('records'))
+              | 'WriteToParquet' >> beam.io.WriteToParquet(
+                  output_path,
+                  arrow_schema,
+                  file_name_suffix='.parquet',
+                  codec='snappy'))
+    else:
+      raise NotImplementedError(
+          f'Unsupported output file format: {file_format}. Supported formats '
+          f'are {labels.FORMAT_TFRECORD} and {_FILE_FORMAT_PARQUET}.')
 
   def _GetSchema(self, schema_path: str) -> schema_pb2.Schema:
     """Gets a tf.metadata schema.
@@ -684,12 +762,15 @@ class TransformProcessor:
       A dataset_metadata.DatasetMetadata representing the provided set of
           columns.
     """
-
-    if (self._IsDataFormatSequenceExample(data_format) or
-        self._IsDataFormatProto(data_format)):
+    if self._IsDataFormatProto(data_format):
       return dataset_metadata.DatasetMetadata(_RAW_EXAMPLE_SCHEMA)
+
     schema_proto = self._GetSchema(schema_path)
-    return dataset_metadata.DatasetMetadata(schema_proto)
+    input_dataset_metadata = dataset_metadata.DatasetMetadata(schema_proto)
+    if self._DecodesSequenceExamplesAsRawRecords(data_format,
+                                                 input_dataset_metadata.schema):
+      return dataset_metadata.DatasetMetadata(_RAW_EXAMPLE_SCHEMA)
+    return input_dataset_metadata
 
   @staticmethod
   @beam.ptransform_fn
@@ -729,7 +810,7 @@ class TransformProcessor:
       stats_output_dir = os.path.dirname(stats_output_loc)
       schema_output_path = os.path.join(stats_output_dir, _SCHEMA_FILE)
       sharded_stats_output_prefix = os.path.join(stats_output_dir,
-                                                 _SHARDED_STATS_PREFIX)
+                                                 SHARDED_STATS_PREFIX)
       anomalies_output_path = os.path.join(stats_output_dir, _ANOMALIES_FILE)
 
     generated_stats = (
@@ -737,12 +818,13 @@ class TransformProcessor:
         | 'FilterInternalColumn' >> beam.Map(_FilterInternalColumn)
         | 'GenerateStatistics' >> tfdv.GenerateStatistics(stats_options))
 
-    if stats_options.experimental_result_partitions > 1:
+    if (stats_options.experimental_result_partitions > 1 and
+        tfdv.default_sharded_output_supported()):
       stats_result = (
           generated_stats
           | 'WriteStats' >> tfdv.WriteStatisticsToRecordsAndBinaryFile(
               binary_proto_path=stats_output_path,
-              tfrecords_path_prefix=sharded_stats_output_prefix))
+              records_path_prefix=sharded_stats_output_prefix))
     else:
       stats_result = (
           generated_stats
@@ -779,9 +861,9 @@ class TransformProcessor:
 
     return (stats_result, schema_result, validation_result)
 
-  # TODO(b/130807807): This is still used by pre-transform stats to decode
-  # sequence example as tf.example. Once the support is implemented this can be
-  # removed.
+  # TODO(b/130807807): This is still used by pre-transform stats to decode raw
+  # sequence examples as tf.example. Once only native sequence example path is
+  # supported this can be removed.
   @beam.typehints.with_input_types(List[bytes])
   @beam.typehints.with_output_types(pa.RecordBatch)
   class _ToArrowRecordBatchesFn(beam.DoFn):
@@ -847,7 +929,9 @@ class TransformProcessor:
                  typespecs: Mapping[str, tf.TypeSpec],
                  preprocessing_fn: Any,
                  cache_source: beam.PTransform,
-                 force_tf_compat_v1: bool):
+                 force_tf_compat_v1: bool,
+                 enable_incremental_cache: bool,
+                 is_stats_enabled: bool):
       # pyformat: enable
       self._input_cache_dir = input_cache_dir
       self._output_cache_dir = output_cache_dir
@@ -856,6 +940,8 @@ class TransformProcessor:
       self._preprocessing_fn = preprocessing_fn
       self._cache_source = cache_source
       self._force_tf_compat_v1 = force_tf_compat_v1
+      self._enable_incremental_cache = enable_incremental_cache
+      self._is_stats_enabled = is_stats_enabled
 
     # TODO(zoy): Remove this method once beam no longer pickles PTransforms,
     # once https://issues.apache.org/jira/browse/BEAM-3812 is resolved.
@@ -866,10 +952,10 @@ class TransformProcessor:
       # picklable.
       return self.to_runner_api_parameter(context)
 
-    def expand(
-        self, pipeline: beam.Pipeline
-    ) -> Tuple[Dict[str, Optional[_Dataset]], Optional[Dict[str, Dict[
-        str, beam.pvalue.PCollection]]], int]:
+    # TODO(b/269419184): Add output typehint when possible:
+    # -> Tuple[Dict[str, Optional[_Dataset]],
+    #          Optional[Dict[str, Dict[str, beam.pvalue.PCollection]]], int]
+    def expand(self, pipeline: beam.Pipeline):
       # TODO(b/170304777): Remove this Create once the issue is fixed in beam.
       # Forcing beam to treat this PTransform as non-primitive.
       _ = pipeline | 'WorkaroundForBug170304777' >> beam.Create([None])
@@ -881,13 +967,14 @@ class TransformProcessor:
           tft_beam.analysis_graph_builder.get_analysis_cache_entry_keys(
               self._preprocessing_fn, self._feature_spec_or_typespec,
               dataset_keys_list, self._force_tf_compat_v1))
-      # We estimate the number of stages in the pipeline to be roughly:
-      # analyzers * analysis_paths * 10.
+      # Without incremental cache, we estimate the number of stages in the
+      # pipeline to be roughly: analyzers * analysis_paths * 10.
       # TODO(b/37788560): Remove this restriction when a greater number of
       # stages can be handled efficiently.
       estimated_stage_count = (
           len(cache_entry_keys) * len(dataset_keys_list) * 10)
-      if estimated_stage_count > _MAX_ESTIMATED_STAGES_COUNT:
+      if (not self._enable_incremental_cache and
+          estimated_stage_count > _MAX_ESTIMATED_STAGES_COUNT):
         logging.warning(
             'Disabling cache because otherwise the number of stages might be '
             'too high (%d analyzers, %d analysis paths)', len(cache_entry_keys),
@@ -896,6 +983,11 @@ class TransformProcessor:
         # cache.
         return ({d.dataset_key: d for d in self._analyze_data_list}, None,
                 estimated_stage_count)
+
+      cacheable_datasets = _GetCacheableDatasetsCount(
+          len(cache_entry_keys), self._is_stats_enabled)
+      if not self._enable_incremental_cache:
+        cacheable_datasets = len(dataset_keys_list)
 
       if self._input_cache_dir is not None:
         logging.info('Reading the following analysis cache entry keys: %s',
@@ -924,14 +1016,45 @@ class TransformProcessor:
                 self._preprocessing_fn, self._feature_spec_or_typespec,
                 dataset_keys_list, input_cache, self._force_tf_compat_v1))
 
+      cached_datasets_count = 0
       new_analyze_data_dict = {}
-      for dataset in self._analyze_data_list:
+      # Processing in reverse order assuming that later datasets are more likely
+      # to be processed again in a future iteration.
+      for dataset in self._analyze_data_list[::-1]:
         if dataset.dataset_key in filtered_analysis_dataset_keys:
-          new_analyze_data_dict[dataset.dataset_key] = dataset
+          # Otherwise the caller will have to make sure the data is read.
+          if cached_datasets_count < cacheable_datasets:
+            new_analyze_data_dict[dataset.dataset_key] = dataset
+            cached_datasets_count += 1
         else:
           new_analyze_data_dict[dataset.dataset_key] = None
 
       return (new_analyze_data_dict, input_cache, estimated_stage_count)
+
+  def _JoinUncachedDatasets(
+      self,
+      analyze_data_list: List[_Dataset],
+      optimized_analyze_data_dict: Dict[analyzer_cache.DatasetKey, _Dataset],
+      input_schema: schema_pb2.Schema,
+      analyze_input_columns: List[str],
+  ):
+    """Joins together datasets that do not particiapte in cache."""
+    original_dataset_count = len(analyze_data_list)
+    flatten_datasets = []
+    filtered_analyze_data_list = []
+    for dataset in analyze_data_list:
+      if dataset.dataset_key not in optimized_analyze_data_dict:
+        flatten_datasets.append(dataset)
+      else:
+        filtered_analyze_data_list.append(dataset)
+    if flatten_datasets:
+      analyze_data_list = filtered_analyze_data_list
+      for dataset in self._MakeProcessJointlyDatasetList(
+          flatten_datasets, input_schema, analyze_input_columns):
+        optimized_analyze_data_dict[dataset.dataset_key] = dataset
+        analyze_data_list.append(dataset)
+    assert len(analyze_data_list) <= original_dataset_count
+    return analyze_data_list, optimized_analyze_data_dict
 
   def Transform(self, inputs: Mapping[str, Any], outputs: Mapping[str, Any],
                 status_file: Optional[str] = None) -> None:
@@ -1023,6 +1146,8 @@ class TransformProcessor:
         inputs, labels.DATA_VIEW_LABEL, strict=False)
     force_tf_compat_v1 = value_utils.GetSoleValue(
         inputs, labels.FORCE_TF_COMPAT_V1_LABEL)
+    save_options = value_utils.GetSoleValue(
+        inputs, labels.SAVE_OPTIONS_LABEL, strict=False)
 
     stats_labels_list = [
         labels.PRE_TRANSFORM_OUTPUT_STATS_PATH_LABEL,
@@ -1041,6 +1166,7 @@ class TransformProcessor:
                        ' specified or none.')
 
     logging.debug('Force tf.compat.v1: %s', force_tf_compat_v1)
+    logging.debug('SaveOptions: %s', save_options)
     logging.debug('Analyze data patterns: %s',
                   list(enumerate(analyze_data_paths)))
     logging.debug('Transform data patterns: %s',
@@ -1114,13 +1240,12 @@ class TransformProcessor:
         transform_paths_file_formats[-1] if materialize_output_paths else None)
     self._RunBeamImpl(analyze_data_list, transform_data_list, preprocessing_fn,
                       stats_options_updater_fn, force_tf_compat_v1,
-                      input_dataset_metadata, transform_output_path,
-                      raw_examples_data_format, temp_path, input_cache_dir,
-                      output_cache_dir, disable_statistics,
-                      per_set_stats_output_paths, materialization_format,
-                      len(analyze_data_paths), stats_output_paths,
-                      make_beam_pipeline_fn)
-  # TODO(b/122478841): Writes status to status file.
+                      save_options, input_dataset_metadata,
+                      transform_output_path, raw_examples_data_format,
+                      temp_path, input_cache_dir, output_cache_dir,
+                      disable_statistics, per_set_stats_output_paths,
+                      materialization_format, len(analyze_data_paths),
+                      stats_output_paths, make_beam_pipeline_fn)
 
   # pylint: disable=expression-not-assigned, no-value-for-parameter
   def _RunBeamImpl(
@@ -1129,6 +1254,7 @@ class TransformProcessor:
       stats_options_updater_fn: Callable[
           [stats_options_util.StatsType, tfdv.StatsOptions],
           tfdv.StatsOptions], force_tf_compat_v1: bool,
+      save_options: Optional[tf.saved_model.SaveOptions],
       input_dataset_metadata: dataset_metadata.DatasetMetadata,
       transform_output_path: str, raw_examples_data_format: int, temp_path: str,
       input_cache_dir: Optional[str], output_cache_dir: Optional[str],
@@ -1146,6 +1272,8 @@ class TransformProcessor:
         options.
       force_tf_compat_v1: If True, call Transform's API to use Tensorflow in
         tf.compat.v1 mode.
+      save_options: An optional tf.saved_model.SaveOptions object to pass down
+        to the Transform component when saving the model.
       input_dataset_metadata: A DatasetMetadata object for the input data.
       transform_output_path: An absolute path to write the output to.
       raw_examples_data_format: The data format of the raw examples. One of the
@@ -1200,7 +1328,8 @@ class TransformProcessor:
     for d in transform_data_list:
       d.tfxio = d.tfxio.Project(transform_input_columns)
 
-    desired_batch_size = self._GetDesiredBatchSize(raw_examples_data_format)
+    desired_batch_size = self._GetDesiredBatchSize(
+        raw_examples_data_format, input_dataset_metadata.schema)
 
     with make_beam_pipeline_fn() as pipeline:
       with tft_beam.Context(
@@ -1208,18 +1337,26 @@ class TransformProcessor:
           desired_batch_size=desired_batch_size,
           passthrough_keys=self._GetTFXIOPassthroughKeys(),
           use_deep_copy_optimization=True,
-          force_tf_compat_v1=force_tf_compat_v1):
+          force_tf_compat_v1=force_tf_compat_v1,
+          save_options=save_options):
         (new_analyze_data_dict, input_cache,
          estimated_stage_count_with_cache) = (
              pipeline
              | 'OptimizeRun' >> self._OptimizeRun(
                  input_cache_dir, output_cache_dir, analyze_data_list,
                  unprojected_typespecs, preprocessing_fn,
-                 self._GetCacheSource(), force_tf_compat_v1))
+                 self._GetCacheSource(), force_tf_compat_v1,
+                 self._EnableIncrementalCache(), not disable_statistics))
+
+        analyze_data_list, new_analyze_data_dict = self._JoinUncachedDatasets(
+            analyze_data_list, new_analyze_data_dict,
+            input_dataset_metadata.schema, analyze_input_columns
+        )
 
         _ = (
             pipeline
-            | 'IncrementPipelineMetrics' >> self._IncrementPipelineMetrics(
+            | 'IncrementPipelineMetrics'
+            >> self._IncrementPipelineMetrics(
                 total_columns_count=len(unprojected_typespecs),
                 analyze_columns_count=analyze_columns_count,
                 transform_columns_count=len(transform_input_columns),
@@ -1228,7 +1365,12 @@ class TransformProcessor:
                 disable_statistics=disable_statistics,
                 materialize=materialization_format is not None,
                 estimated_stage_count_with_cache=(
-                    estimated_stage_count_with_cache)))
+                    estimated_stage_count_with_cache
+                ),
+                cached_datasets=sum(
+                    key.is_cached for key in new_analyze_data_dict),
+            )
+        )
 
         if input_cache:
           logging.debug('Analyzing data with cache.')
@@ -1252,7 +1394,8 @@ class TransformProcessor:
           ]
 
         for dataset in analyze_data_list:
-          infix = 'AnalysisIndex{}'.format(dataset.index)
+          is_joint = '' if dataset.dataset_key.is_cached else 'Joint'
+          infix = f'{is_joint}AnalysisIndex{dataset.index}'
           dataset.standardized = (
               pipeline
               | 'TFXIOReadAndDecode[{}]'.format(infix) >>
@@ -1315,12 +1458,14 @@ class TransformProcessor:
           if (not disable_statistics and
               not self._IsDataFormatProto(raw_examples_data_format)):
             # Aggregated feature stats before transformation.
-            if self._IsDataFormatSequenceExample(raw_examples_data_format):
+            if (self._DecodesSequenceExamplesAsRawRecords(
+                raw_examples_data_format, input_dataset_metadata.schema)):
               schema_proto = None
             else:
               schema_proto = input_dataset_metadata.schema
 
-            if self._IsDataFormatSequenceExample(raw_examples_data_format):
+            if (self._DecodesSequenceExamplesAsRawRecords(
+                raw_examples_data_format, input_dataset_metadata.schema)):
 
               def _ExtractRawExampleBatches(record_batch):
                 return record_batch.column(
@@ -1347,8 +1492,6 @@ class TransformProcessor:
             pre_transform_stats_options = _InvokeStatsOptionsUpdaterFn(
                 stats_options_updater_fn,
                 stats_options_util.StatsType.PRE_TRANSFORM, schema_proto)
-            pre_transform_stats_options.experimental_use_sketch_based_topk_uniques = (
-                self._RunSketchBasedTopKUniques())
             if self._TFDVWriteShardedOutput():
               pre_transform_stats_options.experimental_result_partitions = (
                   _SHARDED_OUTPUT_PARTITIONS)
@@ -1364,12 +1507,12 @@ class TransformProcessor:
                       os.path.join(
                           stats_output_paths[
                               labels.PRE_TRANSFORM_OUTPUT_STATS_PATH_LABEL],
-                          _STATS_FILE),
+                          STATS_FILE),
                   _SHARDED_STATS_KEY:
                       os.path.join(
                           stats_output_paths[
                               labels.PRE_TRANSFORM_OUTPUT_STATS_PATH_LABEL],
-                          _SHARDED_STATS_PREFIX),
+                          SHARDED_STATS_PREFIX),
                   _SCHEMA_KEY:
                       os.path.join(
                           stats_output_paths[
@@ -1424,8 +1567,6 @@ class TransformProcessor:
                 transformed_schema_proto, metadata.asset_map,
                 transform_output_path)
 
-            post_transform_stats_options.experimental_use_sketch_based_topk_uniques = (
-                self._RunSketchBasedTopKUniques())
             if self._TFDVWriteShardedOutput():
               post_transform_stats_options.experimental_result_partitions = (
                   _SHARDED_OUTPUT_PARTITIONS)
@@ -1441,12 +1582,12 @@ class TransformProcessor:
                       os.path.join(
                           stats_output_paths[
                               labels.POST_TRANSFORM_OUTPUT_STATS_PATH_LABEL],
-                          _STATS_FILE),
+                          STATS_FILE),
                   _SHARDED_STATS_KEY:
                       os.path.join(
                           stats_output_paths[
-                              labels.PRE_TRANSFORM_OUTPUT_STATS_PATH_LABEL],
-                          _SHARDED_STATS_PREFIX),
+                              labels.POST_TRANSFORM_OUTPUT_STATS_PATH_LABEL],
+                          SHARDED_STATS_PREFIX),
                   _SCHEMA_KEY:
                       os.path.join(
                           stats_output_paths[
@@ -1498,10 +1639,10 @@ class TransformProcessor:
             for dataset in transform_data_list:
               infix = 'TransformIndex{}'.format(dataset.index)
               (dataset.transformed
-               | 'EncodeAndSerialize[{}]'.format(infix) >> beam.ParDo(
-                   self._RecordBatchToExamplesFn(transformed_schema_proto))
-               | 'Materialize[{}]'.format(infix) >> self._WriteExamples(
-                   materialization_format, dataset.materialize_output_path))
+               | 'EncodeAndWrite[{}]'.format(infix) >> self._EncodeAndWrite(
+                   schema=transformed_schema_proto,
+                   file_format=materialization_format,
+                   output_path=dataset.materialize_output_path))
 
     return _Status.OK()
     # pylint: enable=expression-not-assigned, no-value-for-parameter
@@ -1537,6 +1678,34 @@ class TransformProcessor:
                                  transform_output_path)
 
     return _Status.OK()
+
+  def _MakeProcessJointlyDatasetList(
+      self, datasets: Sequence[_Dataset],
+      input_schema: schema_pb2.Schema,
+      analyze_input_columns: List[str]) -> List[_Dataset]:
+    """Merges datasets to be processed jointly."""
+    file_patterns = []
+    file_formats = []
+    data_format = None
+    data_view_uri = None
+    # Explicitly setting stats and materialize paths to None.
+    stats_output_paths = None
+    materialize_output_paths = None
+    for dataset in datasets:
+      file_patterns.append(dataset.file_pattern)
+      file_formats.append(dataset.file_format)
+      data_format = dataset.data_format
+      data_view_uri = dataset.data_view_uri
+    can_process_jointly = True
+    result = self._MakeDatasetList(
+        file_patterns, file_formats, data_format, data_view_uri,
+        can_process_jointly, stats_output_paths, materialize_output_paths)
+    for dataset in result:
+      # Only non-cacheable datasets ever get joined.
+      dataset.dataset_key = dataset.dataset_key.non_cacheable()
+      dataset.tfxio = self._CreateTFXIO(dataset, input_schema)
+      dataset.tfxio = dataset.tfxio.Project(analyze_input_columns)
+    return result
 
   # TODO(b/114444977): Remove the unused can_process_jointly argument.
   def _MakeDatasetList(
@@ -1586,19 +1755,22 @@ class TransformProcessor:
       dataset.index = index
     return result
 
-  def _ShouldDecodeAsRawExample(self, data_format: int,
-                                data_view_uri: Optional[str]) -> bool:
+  @classmethod
+  def _ShouldDecodeAsRawExample(cls, data_format: int,
+                                data_view_uri: Optional[str],
+                                schema: schema_pb2.Schema) -> bool:
     """Returns true if data format should be decoded as raw example.
 
     Args:
       data_format: One of the enums from example_gen_pb2.PayloadFormat.
       data_view_uri: URI to the DataView to be used to parse the data.
+      schema: A schema_pb2.Schema for the input data.
 
     Returns:
       True if data format should be decoded as raw example.
     """
-    return (self._IsDataFormatSequenceExample(data_format) or
-            (self._IsDataFormatProto(data_format) and data_view_uri is None))
+    return (cls._DecodesSequenceExamplesAsRawRecords(data_format, schema) or
+            (cls._IsDataFormatProto(data_format) and data_view_uri is None))
 
   @staticmethod
   def _IsDataFormatSequenceExample(data_format: int) -> bool:
@@ -1624,18 +1796,41 @@ class TransformProcessor:
     """
     return data_format == example_gen_pb2.FORMAT_PROTO
 
-  def _GetDesiredBatchSize(self, data_format: int) -> Optional[int]:
+  def _GetDesiredBatchSize(self, data_format: int,
+                           schema: schema_pb2.Schema) -> Optional[int]:
     """Returns batch size.
 
     Args:
       data_format: One of the enums from example_gen_pb2.PayloadFormat.
+      schema: A schema for the input data.
 
     Returns:
       Batch size or None.
     """
-    if self._IsDataFormatSequenceExample(data_format):
+    if self._DecodesSequenceExamplesAsRawRecords(data_format, schema):
       return 1
     return None
+
+  @classmethod
+  def _DecodesSequenceExamplesAsRawRecords(cls, data_format: int,
+                                           schema: schema_pb2.Schema) -> bool:
+    """Indicates whether data format is tf.SequenceExample and it should be decoded as raw records.
+
+    Implemented to allow backward compatibility with users exercising hack
+    implementation of SequenceExamples.
+
+    Args:
+      data_format: One of the enums from example_gen_pb2.PayloadFormat.
+      schema: A schema_pb2.Schema for the input data.
+
+    Returns:
+      True if tensor_representation_group absent in Schema for SequenceExample
+      indicating processing SequenceExample as raw records, else False,
+      indicating native execution.
+    """
+
+    return (cls._IsDataFormatSequenceExample(data_format) and
+            not bool(schema.tensor_representation_group))
 
   @staticmethod
   def _GetCacheSource():
@@ -1654,7 +1849,7 @@ class TransformProcessor:
                    schema: schema_pb2.Schema) -> tfxio_module.TFXIO:
     """Creates a TFXIO instance for `dataset`."""
     read_as_raw_records = self._ShouldDecodeAsRawExample(
-        dataset.data_format, dataset.data_view_uri)
+        dataset.data_format, dataset.data_view_uri, schema)
     return tfxio_utils.make_tfxio(
         file_pattern=dataset.file_pattern,
         file_format=dataset.file_format,
@@ -1676,13 +1871,12 @@ class TransformProcessor:
     """Always returns None."""
     return None
 
-  # TODO(b/130885503): clean this up once the sketch-based generator is the
-  # default.
-  @staticmethod
-  def _RunSketchBasedTopKUniques():
-    return False
-
   # TODO(b/215448985): Remove this once sharded stats are written by default.
   @staticmethod
   def _TFDVWriteShardedOutput():
+    return False
+
+  # TODO(b/270338794): Remove this once incremental cache is enabled by default.
+  @classmethod
+  def _EnableIncrementalCache(cls):
     return False

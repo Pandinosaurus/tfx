@@ -16,8 +16,9 @@
 import copy
 import inspect
 import itertools
-from typing import Any, Dict, List, Optional, Type, cast, Mapping
+from typing import Any, cast, Dict, List, Mapping, Optional, Type
 
+from tfx.dsl.component.experimental.json_compat import check_strict_json_compat
 from tfx.dsl.placeholder import placeholder
 from tfx.types import artifact
 from tfx.types import channel
@@ -26,6 +27,29 @@ from tfx.utils import json_utils
 from tfx.utils import proto_utils
 
 from google.protobuf import message
+
+# Use Any to avoid cyclic import.
+_BaseNode = Any
+
+# Execution parameters that have `use_proto=True` but cannot be optimized with
+# Placeholder ph.make_proto.
+# TODO(b/350820714): Placeholder needs to be supported at runtime so that
+# TensorflowTrainerConfig, EventExporterConfig, and TensorflowApiOption
+# can be placeholders.
+# TODO(b/349459258): ExampleDiff executor needs to be updated to support
+# placeholder proto fields not being present.
+# TODO(b/352623284); DistributionValidator test needs to be updated to
+# support placeholder proto.
+# TODO(b/354748588): Support ExecutionParameter list of protos as placeholder so
+# that EvalArgs can be optimized.
+_MAKE_PROTO_EXEMPT_EXEC_PARAMETERS = [
+    'tensorflow_trainer',
+    'example_diff_config',
+    'distribution_validator_config',
+    'event_exporter_config',
+    'tensorflow_api_option',
+    'eval_args',
+]
 
 
 def _is_runtime_param(data: Any) -> bool:
@@ -92,10 +116,13 @@ class ComponentSpec(json_utils.Jsonable):
     - PARAMETERS (as a dict of string keys and ExecutionParameter values),
     - INPUTS (as a dict of string keys and ChannelParameter values),
     - OUTPUTS (also a dict of string keys and ChannelParameter values) and
-    - TYPE_ANNOTATION (as a subclass of SystemExecution from
-    third_party/py/tfx/types/system_executions.py, can be None).
+    - TYPE_ANNOTATION (execution annotations from
+    tfx.v1.dsl.standard_annotations)
 
   Here is an example of how a ComponentSpec may be defined:
+
+  ```python
+  from tfx import v1 as tfx
 
   class MyCustomComponentSpec(ComponentSpec):
     PARAMETERS = {
@@ -107,7 +134,8 @@ class ComponentSpec(json_utils.Jsonable):
     OUTPUTS = {
         'output_examples': ChannelParameter(type=standard_artifacts.Examples),
     }
-    TYPE_ANNOTATION = system_executions.Train
+    TYPE_ANNOTATION = tfx.dsl.standard_annotations.Train
+  ```
 
   To create an instance of a subclass, call it directly with any execution
   parameters / inputs / outputs as kwargs.  For example:
@@ -121,8 +149,8 @@ class ComponentSpec(json_utils.Jsonable):
     PARAMETERS: a dict of string keys and ExecutionParameter values.
     INPUTS: a dict of string keys and ChannelParameter values.
     OUTPUTS: a dict of string keys and ChannelParameter values.
-    TYPE_ANNOTATION: a subclass of SystemExecution used to annotate the
-      component.
+    TYPE_ANNOTATION: an execution annotations from
+      tfx.v1.dsl.standard_annotations.
   """
 
   PARAMETERS: Mapping[str, 'ExecutionParameter']
@@ -181,6 +209,12 @@ class ComponentSpec(json_utils.Jsonable):
             ('INPUTS and OUTPUTS dicts expect values of type ChannelParameter, '
              ' got {}.').format(arg))
 
+    for arg_name, arg in cls.OUTPUTS.items():
+      if arg.allow_empty_explicitly_set:
+        raise TypeError(
+            'Output channels should not explicitly set allow_empty, but output '
+            'channel %s did.' % arg_name)
+
   def _parse_parameters(self, raw_args: Mapping[str, Any]):
     """Parse arguments to ComponentSpec."""
     unparsed_args = set(raw_args.keys())
@@ -212,14 +246,19 @@ class ComponentSpec(json_utils.Jsonable):
         continue
       value = raw_args[arg_name]
 
-      if (inspect.isclass(arg.type) and
-          issubclass(arg.type, message.Message) and value and
-          not _is_runtime_param(value)):
+      if (inspect.isclass(arg.type) and issubclass(arg.type, message.Message)  # pytype: disable=not-supported-yet
+          and value and not _is_runtime_param(value)) and not isinstance(
+              value, placeholder.Placeholder):
+        # If the parameter is defined with use_proto=True, convert the value to
+        # proto from dict or json string if necessary before creating the proto
+        # placeholder.
         if arg.use_proto:
           if isinstance(value, dict):
             value = proto_utils.dict_to_proto(value, arg.type())
           elif isinstance(value, str):
             value = proto_utils.json_to_proto(value, arg.type())
+          if arg_name not in _MAKE_PROTO_EXEMPT_EXEC_PARAMETERS:
+            value = placeholder.make_proto(value)
         else:
           # Create deterministic json string as it will be stored in metadata
           # for cache check.
@@ -243,9 +282,17 @@ class ComponentSpec(json_utils.Jsonable):
 
   @classmethod
   def is_optional_input(cls, key: str) -> bool:
-    """Whether the input channel of the key is optional."""
+    """Returns whether the input channel is optional."""
     try:
       return cast(ChannelParameter, cls.INPUTS[key]).optional
+    except KeyError as e:
+      raise KeyError(f'self.INPUTS = {cls.INPUTS}') from e
+
+  @classmethod
+  def is_allow_empty_input(cls, key: str) -> bool:
+    """Returns whether the input channel is allow_empty."""
+    try:
+      return cast(ChannelParameter, cls.INPUTS[key]).allow_empty
     except KeyError as e:
       raise KeyError(f'self.INPUTS = {cls.INPUTS}') from e
 
@@ -266,6 +313,11 @@ class ComponentSpec(json_utils.Jsonable):
         'outputs': self.outputs,
         'exec_properties': self.exec_properties,
     }
+
+  def migrate_output_channels(self, producer_component: _BaseNode):
+    for key, channel_ in list(self.outputs.items()):
+      if not isinstance(channel_, channel.OutputChannel):
+        self.outputs[key] = channel_.as_output_channel(producer_component, key)
 
 
 class ExecutionParameter:
@@ -307,93 +359,49 @@ class ExecutionParameter:
 
   def type_check(self, arg_name: str, value: Any):
     """Perform type check to the parameter passed in."""
+    if isinstance(value, placeholder.Placeholder):
+      # TODO(b/266800844): Insert a type plausibility check.
+      return
 
-    # Following helper function is needed due to the lack of subscripted
-    # type check support in Python 3.7. Here we hold the assumption that no
-    # nested container type is declared as the parameter type.
-    # For example:
-    # Dict[Text, List[str]] <------ Not allowed.
-    # Dict[Text, Any] <------ Okay.
-    def _type_check_helper(value: Any, declared: Type):  # pylint: disable=g-bare-generic
-      """Helper type-checking function."""
-      if isinstance(value, placeholder.Placeholder):
-        if isinstance(value, placeholder.ChannelWrappedPlaceholder):
-          return
-        placeholders_involved = value.placeholders_involved()
-        if (len(placeholders_involved) != 1 or not isinstance(
-            placeholders_involved[0], placeholder.RuntimeInfoPlaceholder)):
-          placeholders_involved_str = [
-              x.__class__.__name__ for x in placeholders_involved
-          ]
-          raise TypeError(
-              'Only simple RuntimeInfoPlaceholders are supported, but while '
-              'checking parameter %r, the following placeholders were '
-              'involved: %s' % (arg_name, placeholders_involved_str))
-        if not issubclass(declared, str):
-          raise TypeError(
-              'Cannot use Placeholders except for str parameter, but parameter '
-              '%r was of type %s' % (arg_name, declared))
-        return
-
-      is_runtime_param = _is_runtime_param(value)
-      value = _make_default(value)
-      if declared == Any:
-        return
-      if declared.__class__.__name__ in ('_GenericAlias', 'GenericMeta'):
-        # Should be dict or list
-        if declared.__origin__ in [Dict, dict]:  # pylint: disable=protected-access
-          key_type, val_type = declared.__args__[0], declared.__args__[1]
-          if not isinstance(value, dict):
-            raise TypeError('Expecting a dict for parameter %r, but got %s '
-                            'instead' % (arg_name, type(value)))
-          for k, v in value.items():
-            if key_type != Any and not isinstance(k, key_type):
-              raise TypeError('Expecting key type %s for parameter %r, '
-                              'but got %s instead.' %
-                              (str(key_type), arg_name, type(k)))
-            if val_type != Any and not isinstance(v, val_type):
-              raise TypeError('Expecting value type %s for parameter %r, '
-                              'but got %s instead.' %
-                              (str(val_type), arg_name, type(v)))
-        elif declared.__origin__ in [List, list]:  # pylint: disable=protected-access
-          val_type = declared.__args__[0]
-          if not isinstance(value, list):
-            raise TypeError('Expecting a list for parameter %r, '
-                            'but got %s instead.' % (arg_name, type(value)))
-          if val_type == Any:
-            return
-          for item in value:
-            if not isinstance(item, val_type):
-              raise TypeError('Expecting item type %s for parameter %r, '
-                              'but got %s instead.' %
-                              (str(val_type), arg_name, type(item)))
-        else:
-          raise TypeError('Unexpected type of parameter: %r' % arg_name)
-      elif isinstance(value, dict) and issubclass(declared, message.Message):
-        # If a dict is passed in and is compared against a pb message,
-        # do the type-check by converting it to pb message.
-        proto_utils.dict_to_proto(value, declared())
-      elif (isinstance(value, str) and not isinstance(declared, tuple) and
-            issubclass(declared, message.Message)):
-        # Skip check for runtime param string proto.
-        if not is_runtime_param:
-          # If a text is passed in and is compared against a pb message,
-          # do the type-check by converting text (as json) to pb message.
-          proto_utils.json_to_proto(value, declared())
-      else:
-        if not isinstance(value, declared):
-          raise TypeError('Expected type %s for parameter %r '
-                          'but got %s instead.' %
-                          (str(declared), arg_name, value))
-
-    _type_check_helper(value, self.type)
+    is_runtime_param = _is_runtime_param(value)
+    value = _make_default(value)
+    if self.type == Any:
+      return
+    # types.GenericAlias was added in Python 3.9, and we use string
+    # comparisons as a workaround for Python<3.9.
+    if type(self.type).__name__ in ('_GenericAlias', 'GenericAlias'):
+      if not check_strict_json_compat(value, self.type):
+        raise TypeError(
+            f'Expected type {self.type!s} for parameter {arg_name!r} but got '
+            f'{value!s} instead.'
+        )
+    elif isinstance(value, dict) and issubclass(self.type, message.Message):
+      # If a dict is passed in and is compared against a pb message,
+      # do the type-check by converting it to pb message.
+      proto_utils.dict_to_proto(value, self.type())
+    elif (
+        isinstance(value, str)
+        and not isinstance(self.type, tuple)
+        and issubclass(self.type, message.Message)
+    ):
+      # Skip check for runtime param string proto.
+      if not is_runtime_param:
+        # If a text is passed in and is compared against a pb message,
+        # do the type-check by converting text (as json) to pb message.
+        proto_utils.json_to_proto(value, self.type())
+    else:
+      if not isinstance(value, self.type):
+        raise TypeError(
+            f'Expected type {self.type!s} for parameter {arg_name!r} but got '
+            f'{value!s} instead.'
+        )
 
 
 COMPATIBLE_TYPES_KEY = '_compatible_types'
 
 
 class ChannelParameter:
-  """An channel parameter that forms part of a ComponentSpec.
+  """A channel parameter that forms part of a ComponentSpec.
 
   This type of parameter should be specified in the INPUTS and OUTPUTS dict
   fields of a ComponentSpec:
@@ -412,24 +420,81 @@ class ChannelParameter:
   def __init__(
       self,
       type: Optional[Type[artifact.Artifact]] = None,  # pylint: disable=redefined-builtin
-      optional: bool = False):
+      optional: bool = False,
+      allow_empty: Optional[bool] = None,
+      is_async: bool = False,
+  ):
+    """ChannelParameter constructor.
+
+    Note the distinction between `optional` and `allow_empty`.
+
+    An illustrative example: a component may make it optional to provide a
+    specific channel C during pipeline definition time (i.e. set `optional` to
+    True). However, it may require that if the channel C is provided during
+    pipeline definition, during orchestration, the channel must have artifacts
+    before the component is triggered (i.e. set `allow_empty` to False).
+
+    Args:
+      type: Artifact type of artifacts in this channel.
+      optional: Whether providing this channel is optional.
+      allow_empty: Optional. Only applicable to input channels. Whether having
+        inputs to this channel is optional. Should only be explicitly set if
+        `optional` is True. For backwards compatibility, if `optional` is True
+        but this is not specified, we will treat this as True.
+      is_async: Whether the channel parameter is for an intermediate output
+        artifact or not. Defaults to False.
+    """
     if not (inspect.isclass(type) and issubclass(type, artifact.Artifact)):  # pytype: disable=wrong-arg-types
       raise ValueError(
           'Argument "type" of Channel constructor must be a subclass of '
           'tfx.types.Artifact.')
     self.type = type
     self.optional = optional
+    self.is_async = is_async
+
+    if allow_empty is None:
+      # allow_empty not explicitly specified.
+      # * If optional is True, then default to True for backwards compatibility.
+      # * If optional is False, then set to False since the input should
+      #   be mandatory.
+      self.allow_empty_explicitly_set = False
+      allow_empty = optional
+    else:
+      # allow_empty explicitly specified
+      self.allow_empty_explicitly_set = True
+      if not optional:
+        raise ValueError(
+            'allow_empty should only be explicitly set if optional is True'
+        )
+    self.allow_empty = allow_empty
 
   def __repr__(self):
     return 'ChannelParameter(type: %s)' % self.type
 
   def __eq__(self, other):
     return (isinstance(other.__class__, self.__class__) and
-            other.type == self.type and other.optional == self.optional)
+            other.type == self.type and other.optional == self.optional and
+            other.allow_empty == self.allow_empty)
 
-  def type_check(self, arg_name: str, value: channel.BaseChannel):
-    if ((not isinstance(value, channel.BaseChannel)) or
-        not (value.type is self.type or
-             value.type in getattr(self.type, COMPATIBLE_TYPES_KEY, ()))):
-      raise TypeError('Argument %s should be a Channel of type %r (got %s).' %
-                      (arg_name, self.type, value))
+  def type_check(self, arg_name: str, value: channel.BaseChannel):  # pylint: disable=missing-function-docstring
+    if not isinstance(value, channel.BaseChannel):
+      raise TypeError(
+          f'Argument {arg_name} should be a Channel of type {self.type} (got '
+          f'{value}).'
+      )
+    if not (
+        value.type is self.type
+        or value.type.__name__ == self.type.__name__
+        or value.type in getattr(self.type, COMPATIBLE_TYPES_KEY, ())
+    ):
+      raise TypeError(
+          f'Argument {arg_name} should be a Channel of type {self.type} (got '
+          f'{value.type}).'
+      )
+    expect_json_typehint = getattr(self, '_JSON_COMPAT_TYPEHINT', None)
+    if expect_json_typehint is not None:
+      in_json_typehint = getattr(value, '_JSON_COMPAT_TYPEHINT', None)
+      if not check_strict_json_compat(
+          in_type=in_json_typehint, expect_type=expect_json_typehint):
+        raise TypeError('Argument %s should be a Channel of type %r (got %s).' %
+                        (arg_name, expect_json_typehint, in_json_typehint))

@@ -2,10 +2,15 @@
 
 Transform is available as a standalone library.
 
--   [Getting Started with TensorFlow Transform](/tfx/transform/get_started)
--   [TensorFlow Transform API Reference](/tfx/transform/api_docs/python/tft)
+-   [Getting Started with TensorFlow Transform](https://www.tensorflow.org/tfx/transform/get_started)
+-   [TensorFlow Transform API Reference](https://www.tensorflow.org/tfx/transform/api_docs/python/tft)
 
 The `tft` module documentation is the only module that is relevant to TFX users.
 The `tft_beam` module is relevant only when using Transform as a standalone library. Typically, a TFX user constructs a `preprocessing_fn`, and the rest of the
 Transform library calls are made by the Transform component.
 
+You can also use the Apache Beam `MLTransform` class to preprocess data
+for training and inference. The `MLTransform` class wraps multiple TFX data
+processing transforms in one class. For more information, see
+[Preprocess data with MLTransform](https://beam.apache.org/documentation/ml/preprocess-data)
+in the Apache Beam documentation.

@@ -20,6 +20,7 @@ import random
 from typing import Any, Dict, List, Optional, Union
 
 from absl import logging
+from google.api_core import retry as retries
 from google.cloud.aiplatform import gapic
 from google.cloud.aiplatform_v1.types.custom_job import CustomJob
 from google.cloud.aiplatform_v1.types.job_state import JobState
@@ -70,8 +71,8 @@ class AbstractJobClient(abc.ABC):
 
   @abc.abstractmethod
   def create_training_job(self, input_dict, output_dict, exec_properties,
-                          executor_class_path, job_args,
-                          job_id) -> Dict[str, Any]:
+                          executor_class_path, job_args, job_id,
+                          job_labels) -> Dict[str, Any]:
     """Get training args for runner._launch_aip_training.
 
     The training args contain the inputs/outputs/exec_properties to the
@@ -86,6 +87,8 @@ class AbstractJobClient(abc.ABC):
       job_args: Training input argument for AI Platform training job.
       job_id: Job ID for AI Platform Training job. If not supplied,
         system-determined unique ID is given.
+      job_labels: Labels for AI Platform training job.
+
 
     Returns:
       A dict containing the training arguments
@@ -181,11 +184,12 @@ class CAIPJobClient(AbstractJobClient):
         requestBuilder=telemetry_utils.TFXHttpRequest,
     )
 
-  def create_training_job(self, input_dict: Dict[str, List[types.Artifact]],
-                          output_dict: Dict[str, List[types.Artifact]],
-                          exec_properties: Dict[str, Any],
-                          executor_class_path: str, job_args: Dict[str, Any],
-                          job_id: Optional[str]) -> Dict[str, Any]:
+  def create_training_job(
+      self, input_dict: Dict[str, List[types.Artifact]],
+      output_dict: Dict[str, List[types.Artifact]], exec_properties: Dict[str,
+                                                                          Any],
+      executor_class_path: str, job_args: Dict[str, Any], job_id: Optional[str],
+      job_labels: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Get training args for runner._launch_aip_training.
 
     The training args contain the inputs/outputs/exec_properties to the
@@ -204,6 +208,7 @@ class CAIPJobClient(AbstractJobClient):
       job_id: Job ID for AI Platform Training job. If not supplied,
         system-determined unique ID is given. Refer to
       https://cloud.google.com/ml-engine/reference/rest/v1/projects.jobs#resource-job
+      job_labels: Labels for AI Platform training job.
 
     Returns:
       A dict containing the training arguments
@@ -224,9 +229,11 @@ class CAIPJobClient(AbstractJobClient):
       logging.warn('Overriding custom value of containerCommand')
     training_inputs['masterConfig']['containerCommand'] = container_command
 
+    job_labels = job_labels or {}
+
     with telemetry_utils.scoped_labels(
         {telemetry_utils.LABEL_TFX_EXECUTOR: executor_class_path}):
-      job_labels = telemetry_utils.make_labels_dict()
+      job_labels.update(telemetry_utils.make_labels_dict())
 
     # 'tfx_YYYYmmddHHMMSS' is the default job ID if not explicitly specified.
     job_id = job_id or 'tfx_{}'.format(
@@ -306,11 +313,12 @@ class VertexJobClient(AbstractJobClient):
         client_options=dict(api_endpoint=self._region +
                             _VERTEX_ENDPOINT_SUFFIX))
 
-  def create_training_job(self, input_dict: Dict[str, List[types.Artifact]],
-                          output_dict: Dict[str, List[types.Artifact]],
-                          exec_properties: Dict[str, Any],
-                          executor_class_path: str, job_args: Dict[str, Any],
-                          job_id: Optional[str]) -> Dict[str, Any]:
+  def create_training_job(
+      self, input_dict: Dict[str, List[types.Artifact]],
+      output_dict: Dict[str, List[types.Artifact]], exec_properties: Dict[str,
+                                                                          Any],
+      executor_class_path: str, job_args: Dict[str, Any], job_id: Optional[str],
+      job_labels: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Get training args for runner._launch_aip_training.
 
     The training args contain the inputs/outputs/exec_properties to the
@@ -330,10 +338,19 @@ class VertexJobClient(AbstractJobClient):
       job_id: Display name for AI Platform (Unified) custom training job. If not
         supplied, system-determined unique ID is given. Refer to
         https://cloud.google.com/vertex-ai/docs/reference/rest/v1/projects.locations.customJobs#CustomJob
+      job_labels: Not applicable for Vertex AI, where labels are specified in
+        the CustomJob as defined in
+        https://cloud.google.com/vertex-ai/docs/reference/rest/v1/projects.locations.customJobs#CustomJob.
 
     Returns:
       A dict containing the Vertex AI CustomJob
     """
+    if job_labels:
+      logging.warn(
+          'Job labels in custom_config are ignored by Vertex, where labels are '
+          'specified in the CustomJob as defined in '
+          'https://cloud.google.com/vertex-ai/docs/reference/rest/v1/projects.locations.customJobs#CustomJob.'
+      )
     job_args = job_args.copy()
     if job_args.get('job_spec'):
       custom_job_spec = job_args['job_spec']
@@ -407,7 +424,10 @@ class VertexJobClient(AbstractJobClient):
 
   def get_job(self) -> CustomJob:
     """Gets the long-running job."""
-    return self._client.get_custom_job(name=self._job_name)
+    return self._client.get_custom_job(
+        name=self._job_name,
+        retry=retries.Retry(),  # Use default Retry on getting the custom job
+    )
 
   def get_job_state(self, response) -> JobState:
     """Gets the state of the long-running job.

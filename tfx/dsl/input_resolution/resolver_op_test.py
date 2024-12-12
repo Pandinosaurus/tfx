@@ -13,31 +13,42 @@
 # limitations under the License.
 """Tests for tfx.dsl.input_resolution.resolver_op."""
 import copy
-from typing import Optional, Mapping
+from typing import Optional, Mapping, Set
 
 import tensorflow as tf
-
 from tfx.dsl.input_resolution import resolver_op
+import tfx.types
+from tfx.types import standard_artifacts
 
 
 class Foo(resolver_op.ResolverOp):
-  foo = resolver_op.ResolverOpProperty(type=int)
+  foo = resolver_op.Property(type=int)
 
   def apply(self, input_dict):
     return input_dict
 
 
 class Bar(resolver_op.ResolverOp):
-  bar = resolver_op.ResolverOpProperty(type=str, default='bar')
+  bar = resolver_op.Property(type=str, default='bar')
 
   def apply(self, input_dict):
     return input_dict
 
 
+class EmptyArtifactList(
+    resolver_op.ResolverOp,
+    canonical_name='testing.Baz',
+    arg_data_types=(),
+    return_data_type=resolver_op.DataType.ARTIFACT_LIST):
+
+  def apply(self):
+    return []
+
+
 class Repeat(
     resolver_op.ResolverOp,
-    return_data_type=resolver_op.DataTypes.ARTIFACT_MULTIMAP_LIST):
-  n = resolver_op.ResolverOpProperty(type=int)
+    return_data_type=resolver_op.DataType.ARTIFACT_MULTIMAP_LIST):
+  n = resolver_op.Property(type=int)
 
   def apply(self, input_dict):
     return [copy.deepcopy(input_dict) for _ in range(self.n)]
@@ -45,10 +56,48 @@ class Repeat(
 
 class TakeLast(
     resolver_op.ResolverOp,
-    arg_data_types=(resolver_op.DataTypes.ARTIFACT_MULTIMAP_LIST,)):
+    arg_data_types=(resolver_op.DataType.ARTIFACT_MULTIMAP_LIST,)):
 
   def apply(self, input_dicts):
     return input_dicts[-1]
+
+
+class ManyArtifacts(
+    resolver_op.ResolverOp,
+    arg_data_types=(),
+    return_data_type=resolver_op.DataType.ARTIFACT_LIST):
+
+  def apply(self):
+    return []
+
+
+class DummyChannel(tfx.types.BaseChannel):
+
+  def __eq__(self, other):
+    return isinstance(other, DummyChannel) and self.type == other.type
+
+  def __hash__(self):
+    return hash(self.type)
+
+  def get_data_dependent_node_ids(self) -> Set[str]:
+    return set()
+
+
+class X(tfx.types.Artifact):
+  TYPE_NAME = 'X'
+
+
+class Y(tfx.types.Artifact):
+  TYPE_NAME = 'Y'
+
+
+class Z(tfx.types.Artifact):
+  TYPE_NAME = 'Z'
+
+
+DUMMY_INPUT_NODE = resolver_op.DictNode({
+    'x': resolver_op.InputNode(DummyChannel(X))
+})
 
 
 class ResolverOpTest(tf.test.TestCase):
@@ -56,27 +105,27 @@ class ResolverOpTest(tf.test.TestCase):
   def testDefineOp_PropertyDefaultViolatesType(self):
     with self.assertRaises(TypeError):
       class BadProperty(resolver_op.ResolverOp):  # pylint: disable=unused-variable
-        str_prop = resolver_op.ResolverOpProperty(type=str, default=42)
+        str_prop = resolver_op.Property(type=str, default=42)
 
   def testOpCall_ReturnsOpNode(self):
-    result = Foo(resolver_op.OpNode.INPUT_NODE, foo=42)
+    result = Foo(DUMMY_INPUT_NODE, foo=42)
     self.assertIsInstance(result, resolver_op.OpNode)
-    self.assertEqual(repr(result), 'Foo(INPUT_NODE, foo=42)')
+    self.assertEqual(repr(result), 'Foo(Dict(x=Input()), foo=42)')
 
   def testOpCall_MissingRequiredProperty(self):
     with self.assertRaisesRegex(
         ValueError, 'Required property foo is missing.'):
-      Foo(resolver_op.OpNode.INPUT_NODE)
+      Foo(DUMMY_INPUT_NODE)
 
   def testOpCall_UnknownProperty(self):
     with self.assertRaisesRegex(
         KeyError, 'Unknown property bar.'):
-      Foo(resolver_op.OpNode.INPUT_NODE, foo=42, bar='zz')
+      Foo(DUMMY_INPUT_NODE, foo=42, bar='zz')
 
   def testOpCall_PropertyTypeCheck(self):
     with self.assertRaisesRegex(
         TypeError, "foo should be <class 'int'> but got '42'."):
-      Foo(resolver_op.OpNode.INPUT_NODE, foo='42')
+      Foo(DUMMY_INPUT_NODE, foo='42')
 
   def testOpCreate_ReturnsOp(self):
     result = Foo.create(foo=42)
@@ -84,14 +133,14 @@ class ResolverOpTest(tf.test.TestCase):
     self.assertEqual(result.foo, 42)
 
   def testOpCreate_CannotTakeMultipleArgs(self):
-    foo1 = Foo(resolver_op.OpNode.INPUT_NODE, foo=1)
-    foo2 = Foo(resolver_op.OpNode.INPUT_NODE, foo=2)
-    with self.assertRaises(TypeError):
+    foo1 = Foo(DUMMY_INPUT_NODE, foo=1)
+    foo2 = Foo(DUMMY_INPUT_NODE, foo=2)
+    with self.assertRaises(ValueError):
       Bar(foo1, foo2)
 
   def testOpCreate_InvalidArg(self):
     with self.assertRaisesRegex(
-        ValueError, 'Cannot directly call ResolverOp with real values.'):
+        ValueError, r'Expected dict\[str, Node\]'):
       Bar({'foo': []})
 
   def testOpCreate_MissingRequiredProperty(self):
@@ -110,7 +159,7 @@ class ResolverOpTest(tf.test.TestCase):
       Foo.create(foo='42')
 
   def testOpCreate_ArgumentTypeCheck(self):
-    input_node = resolver_op.OpNode.INPUT_NODE
+    input_node = DUMMY_INPUT_NODE
 
     with self.subTest('Need List[Dict] but got Dict.'):
       with self.assertRaisesRegex(
@@ -120,6 +169,10 @@ class ResolverOpTest(tf.test.TestCase):
 
     with self.subTest('No Error'):
       TakeLast(Repeat(input_node, n=2))
+
+  def testOpCreate_DictArg_ConvertedToDictNode(self):
+    result = Bar({'foo': ManyArtifacts()})
+    self.assertEqual(repr(result), 'Bar(Dict(foo=ManyArtifacts()))')
 
   def testOpProperty_DefaultValue(self):
     result = Bar.create()
@@ -133,7 +186,7 @@ class ResolverOpTest(tf.test.TestCase):
   def testOpProperty_ComplexTypeCheck(self):
 
     class CustomOp(resolver_op.ResolverOp):
-      optional_mapping = resolver_op.ResolverOpProperty(
+      optional_mapping = resolver_op.Property(
           type=Optional[Mapping[str, str]], default=None)
 
       def apply(self, input_dict):
@@ -150,29 +203,19 @@ class ResolverOpTest(tf.test.TestCase):
       CustomOp.create(optional_mapping=[])
 
 
-class OpNodeTest(tf.test.TestCase):
+class NodeTest(tf.test.TestCase):
 
   def testOpNode_Repr(self):
-    input_node = resolver_op.OpNode.INPUT_NODE
+    input_node = DUMMY_INPUT_NODE
     foo = resolver_op.OpNode(
-        op_type=Foo, arg=input_node, kwargs={'foo': 42})
+        op_type=Foo, args=[input_node], kwargs={'foo': 42})
     bar = resolver_op.OpNode(
-        op_type=Bar, arg=foo, kwargs={'bar': 'z'})
+        op_type=Bar, args=[foo], kwargs={'bar': 'z'})
 
-    self.assertEqual(repr(bar), "Bar(Foo(INPUT_NODE, foo=42), bar='z')")
-
-  def testOpNode_OpTypeMustBeResolverOpSubclass(self):
-    class NotResolverOp:
-      pass
-
-    with self.assertRaises(TypeError):
-      resolver_op.OpNode(op_type=NotResolverOp)
-
-    with self.assertRaises(TypeError):
-      resolver_op.OpNode(op_type=Foo.create(foo=42))  # Not an instance!
+    self.assertEqual(repr(bar), "Bar(Foo(Dict(x=Input()), foo=42), bar='z')")
 
   def testOpNode_ArgsMustBeOpNodeSequence(self):
-    node = resolver_op.OpNode.INPUT_NODE
+    node = DUMMY_INPUT_NODE
 
     with self.assertRaises(TypeError):
       resolver_op.OpNode(op_type=Foo, args=node)  # Not a Sequence!
@@ -180,13 +223,57 @@ class OpNodeTest(tf.test.TestCase):
     with self.assertRaises(TypeError):
       resolver_op.OpNode(op_type=Foo, args=[42])  # Element is not OpNode!
 
-  def testOpNode_IsInputNode(self):
-    input_node = resolver_op.OpNode.INPUT_NODE
-    foo = Foo(input_node, foo=42)
+  def testEqualityAndHash(self):
+    with self.subTest('Node'):
+      n1 = resolver_op.Node()
+      n2 = resolver_op.Node()
+      self.assertNotEqual(n1, n2)
 
-    self.assertTrue(input_node.is_input_node)
-    self.assertFalse(foo.is_input_node)
+    with self.subTest('OpNode'):
+      n3 = resolver_op.OpNode(
+          op_type=EmptyArtifactList,
+          output_data_type=resolver_op.DataType.ARTIFACT_LIST,
+          args=())
+      n4 = resolver_op.OpNode(
+          op_type=EmptyArtifactList,
+          output_data_type=resolver_op.DataType.ARTIFACT_LIST,
+          args=())
+      self.assertNotEqual(n3, n4)
 
+    with self.subTest('DictNode'):
+      n1.output_data_type = resolver_op.DataType.ARTIFACT_LIST
+      n2.output_data_type = resolver_op.DataType.ARTIFACT_LIST
+      n5 = resolver_op.DictNode({'x': n1, 'y': n3})
+      n6 = resolver_op.DictNode({'x': n1, 'y': n3})
+      n7 = resolver_op.DictNode({'x': n2, 'y': n4})
+      self.assertEqual(n5, n6)
+      self.assertNotEqual(n5, n7)
+      self.assertLen({n5, n6, n7}, 2)
 
-if __name__ == '__main__':
-  tf.test.main()
+    with self.subTest('InputNode'):
+      n8 = resolver_op.InputNode(DummyChannel(standard_artifacts.Model))
+      n9 = resolver_op.InputNode(DummyChannel(standard_artifacts.Model))
+      n10 = resolver_op.InputNode(DummyChannel(standard_artifacts.Examples))
+      self.assertEqual(n8, n9)
+      self.assertNotEqual(n8, n10)
+      self.assertLen({n8, n9, n10}, 2)
+
+  def testFindInputNodes(self):
+    input_x = resolver_op.InputNode(DummyChannel(X))
+    input_y = resolver_op.InputNode(DummyChannel(Y))
+    input_z = resolver_op.InputNode(DummyChannel(Z))
+    input_xz = resolver_op.DictNode({'x': input_x, 'z': input_z})
+
+    op_x_plus_y = resolver_op.OpNode(
+        op_type='add',
+        output_data_type=resolver_op.DataType.ARTIFACT_LIST,
+        args=(input_x, input_y))
+    dict_x_plus_y = resolver_op.DictNode({'x+y': op_x_plus_y})
+    result = resolver_op.OpNode(
+        op_type='merge',
+        output_data_type=resolver_op.DataType.ARTIFACT_MULTIMAP,
+        args=(input_xz, dict_x_plus_y))
+
+    self.assertCountEqual(
+        resolver_op.get_input_nodes(result),
+        [input_x, input_y, input_z])

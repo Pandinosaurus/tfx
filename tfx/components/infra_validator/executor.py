@@ -329,7 +329,7 @@ class Executor(base_executor.BaseExecutor):
             model_name=serving_spec.model_name,
             version=int(time.time()))
         io_utils.copy_dir(src=model_path, dst=temp_model_path)
-        self._AddCleanup(io_utils.delete_dir, self._context.get_tmp_path())
+        self._AddCleanup(io_utils.delete_dir, self._get_tmp_dir())
         return temp_model_path
 
     return model_path
@@ -396,6 +396,18 @@ class Executor(base_executor.BaseExecutor):
       # Check model can be successfully queried.
       if requests:
         client.SendRequests(requests)
+    except Exception:  # pylint: disable=broad-except
+      logging.exception('Error occurred during infra validation.')
+      maybe_logs = runner.GetLogs()
+      if maybe_logs:
+        logging.error(
+            'Fetching model server logs:\n'
+            'BEGIN_MODEL_SERVER_LOG\n'
+            '%s\n'
+            'END_MODEL_SERVER_LOG', maybe_logs)
+      else:
+        logging.error('No model server logs available.')
+      raise
     finally:
       logging.info('Stopping %r.', runner)
       runner.Stop()

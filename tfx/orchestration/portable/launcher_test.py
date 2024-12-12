@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Tests for tfx.orchestration.portable.launcher."""
+
 import contextlib
 import copy
 import os
+from typing import Any
 from unittest import mock
 
-import tensorflow as tf
 from tfx import types
 from tfx import version as tfx_version
 from tfx.dsl.compiler import constants
@@ -37,6 +38,7 @@ from tfx.proto.orchestration import driver_output_pb2
 from tfx.proto.orchestration import executable_spec_pb2
 from tfx.proto.orchestration import execution_result_pb2
 from tfx.proto.orchestration import pipeline_pb2
+from tfx.types import standard_artifacts
 from tfx.utils import test_case_utils
 
 from google.protobuf import text_format
@@ -74,6 +76,10 @@ class _FakeEmptyExecutorOperator(base_executor_operator.BaseExecutorOperator):
 
   SUPPORTED_EXECUTOR_SPEC_TYPE = [_PYTHON_CLASS_EXECUTABLE_SPEC]
   SUPPORTED_PLATFORM_CONFIG_TYPE = None
+
+  # If you see this default value in your test output, run_executor() has not
+  # been called.
+  _exec_properties: dict[str, Any] = {'Not yet executed??': 'No exec props set'}
 
   def run_executor(
       self, execution_info: data_types.ExecutionInfo
@@ -137,7 +143,7 @@ class _FakeExampleGenLikeDriver(base_driver.BaseDriver):
 
   def __init__(self, mlmd_connection: metadata.Metadata):
     super().__init__(mlmd_connection)
-    self._self_output = text_format.Parse(
+    node_inputs = text_format.Parse(
         """
       inputs {
         key: "examples"
@@ -173,9 +179,10 @@ class _FakeExampleGenLikeDriver(base_driver.BaseDriver):
             }
             output_key: "output_examples"
           }
-          min_count: 1
+          min_count: 0
         }
       }""", pipeline_pb2.NodeInputs())
+    self._pipeline_node = pipeline_pb2.PipelineNode(inputs=node_inputs)
 
   def run(self, execution_info) -> driver_output_pb2.DriverOutput:
     # Fake a constant span number, which, on prod, is usually calculated based
@@ -183,7 +190,8 @@ class _FakeExampleGenLikeDriver(base_driver.BaseDriver):
     span = 2
     with self._mlmd_connection as m:
       previous_output = inputs_utils.resolve_input_artifacts(
-          m, self._self_output)
+          metadata_handle=m, pipeline_node=self._pipeline_node
+      )[0]
 
       # Version should be the max of existing version + 1 if span exists,
       # otherwise 0.
@@ -243,6 +251,14 @@ class LauncherTest(test_case_utils.TfxTest):
     self._pipeline_run_id_counter = 0
     self.reloadPipelineWithNewRunId()
 
+    self._dynamic_exec_properties_pipeline = pipeline_pb2.Pipeline()
+    self.load_proto_from_text(
+        os.path.join(
+            os.path.dirname(__file__), 'testdata',
+            'dynamic_exec_properties_pipeline_for_launcher_test.pbtxt'),
+        self._dynamic_exec_properties_pipeline)
+    self.reloadDynamicExecPropertiesPipelineWithNewRunId()
+
     # Fakes an ExecutorSpec for Trainer
     self._trainer_executor_spec = _PYTHON_CLASS_EXECUTABLE_SPEC()
     # Fakes an executor operator
@@ -252,6 +268,21 @@ class LauncherTest(test_case_utils.TfxTest):
     # Fakes an custom driver spec
     self._custom_driver_spec = _PYTHON_CLASS_EXECUTABLE_SPEC()
     self._custom_driver_spec.class_path = 'tfx.orchestration.portable.launcher_test._FakeExampleGenLikeDriver'
+
+  def reloadDynamicExecPropertiesPipelineWithNewRunId(self):
+    self._pipeline_run_id_counter += 1
+    pipeline = pipeline_pb2.Pipeline()
+    pipeline.CopyFrom(
+        self._dynamic_exec_properties_pipeline)
+    runtime_parameter_utils.substitute_runtime_parameter(
+        pipeline, {
+            constants.PIPELINE_RUN_ID_PARAMETER_NAME:
+                f'test_run_{self._pipeline_run_id_counter}',
+        })
+    self._pipeline_runtime_spec.pipeline_run_id.field_value.string_value = (
+        f'test_run_{self._pipeline_run_id_counter}')
+    self._downstream_component = pipeline.nodes[
+        1].pipeline_node
 
   def reloadPipelineWithNewRunId(self):
     self._pipeline_run_id_counter += 1
@@ -291,12 +322,13 @@ class LauncherTest(test_case_utils.TfxTest):
         execution = execution_publish_utils.register_execution(
             m, example_gen.node_info.type, contexts)
         publish_execution(
-            metadata_handler=m,
+            metadata_handle=m,
             execution_id=execution.id,
             contexts=contexts,
             output_artifacts={
                 'output_examples': [output_example],
-            })
+            },
+        )
 
       if transform:
         # Publishes Transform output.
@@ -307,12 +339,13 @@ class LauncherTest(test_case_utils.TfxTest):
         execution = execution_publish_utils.register_execution(
             m, transform.node_info.type, contexts)
         publish_execution(
-            metadata_handler=m,
+            metadata_handle=m,
             execution_id=execution.id,
             contexts=contexts,
             output_artifacts={
                 'transform_graph': [output_transform_graph],
-            })
+            },
+        )
 
   @staticmethod
   def fakeExampleGenOutput(mlmd_connection: metadata.Metadata,
@@ -353,9 +386,15 @@ class LauncherTest(test_case_utils.TfxTest):
           last_known_state: FAILED
           """,
           executions[0],
-          ignored_fields=['type_id', 'custom_properties',
-                          'create_time_since_epoch',
-                          'last_update_time_since_epoch'])
+          ignored_fields=[
+              'type_id',
+              'type',
+              'custom_properties',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
   def testLauncher_InputPartiallyReady(self):
     # No new execution is triggered and registered if all inputs are not ready.
@@ -385,9 +424,15 @@ class LauncherTest(test_case_utils.TfxTest):
           last_known_state: FAILED
           """,
           new_executions[0],
-          ignored_fields=['type_id', 'custom_properties',
-                          'create_time_since_epoch',
-                          'last_update_time_since_epoch'])
+          ignored_fields=[
+              'type_id',
+              'type',
+              'custom_properties',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
   def testLauncher_EmptyOptionalInputTriggersExecution(self):
     self.reloadPipelineWithNewRunId()
@@ -413,23 +458,21 @@ class LauncherTest(test_case_utils.TfxTest):
           """
           id: 1
           custom_properties {
-            key: "name"
-            value {
-              string_value: ":test_run_%d:my_trainer:model:0"
-            }
-          }
-          custom_properties {
             key: "tfx_version"
             value {
               string_value: "0.123.4.dev"
             }
           }
-          state: LIVE""" % self._pipeline_run_id_counter,
+          state: LIVE""",
           artifact,
           ignored_fields=[
-              'type_id', 'uri', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'uri',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
       [execution] = m.store.get_executions_by_id([execution_info.execution_id])
       self.assertProtoPartiallyEquals(
           """
@@ -438,9 +481,13 @@ class LauncherTest(test_case_utils.TfxTest):
           """,
           execution,
           ignored_fields=[
-              'type_id', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
   def testLauncher_PublishingNewArtifactsAndUseCache(self):
     # In this test case, there are two executions:
@@ -465,9 +512,9 @@ class LauncherTest(test_case_utils.TfxTest):
           """
           id: 3
           custom_properties {
-            key: "name"
+            key: "is_external"
             value {
-              string_value: ":test_run_%d:my_trainer:model:0"
+              int_value: 0
             }
           }
           custom_properties {
@@ -476,12 +523,16 @@ class LauncherTest(test_case_utils.TfxTest):
               string_value: "0.123.4.dev"
             }
           }
-          state: LIVE""" % self._pipeline_run_id_counter,
+          state: LIVE""",
           artifact,
           ignored_fields=[
-              'type_id', 'uri', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'uri',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
       [execution] = m.store.get_executions_by_id([execution_info.execution_id])
       self.assertProtoPartiallyEquals(
           """
@@ -490,9 +541,13 @@ class LauncherTest(test_case_utils.TfxTest):
           """,
           execution,
           ignored_fields=[
-              'type_id', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
     self.reloadPipelineWithNewRunId()
     execution_info = launcher.Launcher(
@@ -512,9 +567,13 @@ class LauncherTest(test_case_utils.TfxTest):
           """,
           execution,
           ignored_fields=[
-              'type_id', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
   def testLauncher_CacheIsSupportedForNodeWithNoOutput(self):
     # Even though a node has no output at all, the launcher should treat the
@@ -540,9 +599,13 @@ class LauncherTest(test_case_utils.TfxTest):
           """,
           execution,
           ignored_fields=[
-              'type_id', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
     self.reloadPipelineWithNewRunId()
     self._trainer.ClearField('outputs')
@@ -563,9 +626,13 @@ class LauncherTest(test_case_utils.TfxTest):
           """,
           execution,
           ignored_fields=[
-              'type_id', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
   def testLauncher_CacheDisabled(self):
     # In this test case, there are two executions:
@@ -592,9 +659,9 @@ class LauncherTest(test_case_utils.TfxTest):
           """
           id: 3
           custom_properties {
-            key: "name"
+            key: "is_external"
             value {
-              string_value: ":test_run_%d:my_trainer:model:0"
+              int_value: 0
             }
           }
           custom_properties {
@@ -603,12 +670,16 @@ class LauncherTest(test_case_utils.TfxTest):
               string_value: "0.123.4.dev"
             }
           }
-          state: LIVE""" % self._pipeline_run_id_counter,
+          state: LIVE""",
           artifact,
           ignored_fields=[
-              'type_id', 'uri', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'uri',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
       [execution] = m.store.get_executions_by_id([execution_info.execution_id])
       self.assertProtoPartiallyEquals(
           """
@@ -617,9 +688,13 @@ class LauncherTest(test_case_utils.TfxTest):
           """,
           execution,
           ignored_fields=[
-              'type_id', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
     self.reloadPipelineWithNewRunId()
     self._trainer.execution_options.caching_options.enable_cache = False
@@ -638,9 +713,9 @@ class LauncherTest(test_case_utils.TfxTest):
           """
           id: 4
           custom_properties {
-            key: "name"
+            key: "is_external"
             value {
-              string_value: ":test_run_%d:my_trainer:model:0"
+              int_value: 0
             }
           }
           custom_properties {
@@ -649,12 +724,16 @@ class LauncherTest(test_case_utils.TfxTest):
               string_value: "0.123.4.dev"
             }
           }
-          state: LIVE""" % self._pipeline_run_id_counter,
+          state: LIVE""",
           artifacts[1],
           ignored_fields=[
-              'type_id', 'uri', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'uri',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
       [execution] = m.store.get_executions_by_id([execution_info.execution_id])
       self.assertProtoPartiallyEquals(
           """
@@ -663,9 +742,13 @@ class LauncherTest(test_case_utils.TfxTest):
           """,
           execution,
           ignored_fields=[
-              'type_id', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
   def testLauncher_ReEntry(self):
     # Some executors or runtime environment may reschedule the launcher job
@@ -703,18 +786,20 @@ class LauncherTest(test_case_utils.TfxTest):
     # state.
     with self._mlmd_connection as m:
       contexts = context_lib.prepare_contexts(
-          metadata_handler=m,
-          node_contexts=test_launcher._pipeline_node.contexts)
+          metadata_handle=m, node_contexts=test_launcher._pipeline_node.contexts
+      )
       exec_properties = data_types_utils.build_parsed_value_dict(
           inputs_utils.resolve_parameters_with_schema(
               node_parameters=test_launcher._pipeline_node.parameters))
       input_artifacts = inputs_utils.resolve_input_artifacts(
-          metadata_handler=m, node_inputs=test_launcher._pipeline_node.inputs)
+          metadata_handle=m, pipeline_node=test_launcher._pipeline_node
+      )[0]
       first_execution = test_launcher._register_or_reuse_execution(
-          metadata_handler=m,
+          metadata_handle=m,
           contexts=contexts,
           input_artifacts=input_artifacts,
-          exec_properties=exec_properties)
+          exec_properties=exec_properties,
+      )
       self.assertEqual(first_execution.last_known_state,
                        metadata_store_pb2.Execution.RUNNING)
 
@@ -762,9 +847,9 @@ class LauncherTest(test_case_utils.TfxTest):
           """
           id: 3
           custom_properties {
-            key: "name"
+            key: "is_external"
             value {
-              string_value: ":test_run_%d:my_trainer:model:0"
+              int_value: 0
             }
           }
           custom_properties {
@@ -773,12 +858,16 @@ class LauncherTest(test_case_utils.TfxTest):
               string_value: "0.123.4.dev"
             }
           }
-          state: LIVE""" % self._pipeline_run_id_counter,
+          state: LIVE""",
           artifact,
           ignored_fields=[
-              'type_id', 'uri', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'uri',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
       [execution] = m.store.get_executions_by_id([execution_info.execution_id])
       self.assertProtoPartiallyEquals(
           """
@@ -787,9 +876,13 @@ class LauncherTest(test_case_utils.TfxTest):
           """,
           execution,
           ignored_fields=[
-              'type_id', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
   def testLauncher_ExecutionFailed(self):
     # In the case that the executor failed and raises an execption.
@@ -849,9 +942,13 @@ class LauncherTest(test_case_utils.TfxTest):
           """,
           executions[-1],
           ignored_fields=[
-              'type_id', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
   def testLauncher_with_CustomDriver_NewSpan(self):
     self.reloadPipelineWithNewRunId()
@@ -871,9 +968,9 @@ class LauncherTest(test_case_utils.TfxTest):
           """
           id: 1
           custom_properties {
-            key: "name"
+            key: "is_external"
             value {
-              string_value: ":test_run_%d:my_example_gen:output_examples:0"
+              int_value: 0
             }
           }
           custom_properties {
@@ -894,12 +991,16 @@ class LauncherTest(test_case_utils.TfxTest):
               string_value: "0.123.4.dev"
             }
           }
-          state: LIVE""" % self._pipeline_run_id_counter,
+          state: LIVE""",
           artifact,
           ignored_fields=[
-              'type_id', 'uri', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'uri',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
 
   def testLauncher_with_CustomDriver_ExistingSpan(self):
     LauncherTest.fakeExampleGenOutput(self._mlmd_connection, self._example_gen,
@@ -925,9 +1026,9 @@ class LauncherTest(test_case_utils.TfxTest):
           """
           id: 2
           custom_properties {
-            key: "name"
+            key: "is_external"
             value {
-              string_value: ":test_run_%d:my_example_gen:output_examples:0"
+              int_value: 0
             }
           }
           custom_properties {
@@ -948,12 +1049,16 @@ class LauncherTest(test_case_utils.TfxTest):
               string_value: "0.123.4.dev"
             }
           }
-          state: LIVE""" % self._pipeline_run_id_counter,
+          state: LIVE""",
           artifact,
           ignored_fields=[
-              'type_id', 'uri', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'uri',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
 
   def testLauncher_importer_node(self):
     mock_import_node_handler_class = mock.create_autospec(
@@ -1001,6 +1106,89 @@ class LauncherTest(test_case_utils.TfxTest):
         self._pipeline_runtime_spec)
     self.assertEqual(execution_info, expected_execution_info)
 
+  def testLauncher_DynamicExecPropertiesExecution_Success(self):
+    self.reloadDynamicExecPropertiesPipelineWithNewRunId()
+    self._test_executor_operators = {
+        _PYTHON_CLASS_EXECUTABLE_SPEC: _FakeEmptyExecutorOperator
+    }
+    fake_input_num = standard_artifacts.Integer()
+    fake_input_num.uri = self.create_tempfile().full_path
+    fake_input_num.value = 1
+    mock_resolve_input_artifacts = self.enter_context(
+        mock.patch.object(
+            inputs_utils,
+            'resolve_input_artifacts',
+            autospec=True,
+            return_value=[
+                {'_UpstreamComponent.num': [fake_input_num]},
+            ],
+        )
+    )
 
-if __name__ == '__main__':
-  tf.test.main()
+    test_launcher = launcher.Launcher(
+        pipeline_node=self._downstream_component,
+        mlmd_connection=self._mlmd_connection,
+        pipeline_info=self._pipeline_info,
+        pipeline_runtime_spec=self._pipeline_runtime_spec,
+        executor_spec=self._trainer_executor_spec,
+        custom_executor_operators=self._test_executor_operators)
+    execution_info = test_launcher.launch()
+    mock_resolve_input_artifacts.assert_called_once()
+
+    with self._mlmd_connection as m:
+      [execution] = m.store.get_executions_by_id([execution_info.execution_id])
+      self.assertEqual(
+          {'input_num': 1, 'input_str': execution_info.pipeline_run_id},
+          test_launcher._executor_operator._exec_properties,
+      )
+      self.assertProtoPartiallyEquals(
+          """
+          last_known_state: COMPLETE
+          custom_properties {
+            key: "input_num"
+              value {
+                int_value: 1
+              }
+          }
+          custom_properties {
+            key: "input_str"
+              value {
+                string_value: "%s"
+              }
+          }
+          """ % execution_info.pipeline_run_id,
+          execution,
+          ignored_fields=[
+              'id',
+              'type_id',
+              'type',
+              'name',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
+
+  def testLauncher_DynamicExecPropertiesExecution_Fail(self):
+    self.reloadDynamicExecPropertiesPipelineWithNewRunId()
+    self._test_executor_operators = {
+        _PYTHON_CLASS_EXECUTABLE_SPEC: _FakeEmptyExecutorOperator
+    }
+    self.enter_context(
+        mock.patch.object(
+            inputs_utils,
+            'resolve_dynamic_parameters',
+            autospec=True,
+            side_effect=ValueError('resolving prop error'),
+        )
+    )
+
+    test_launcher = launcher.Launcher(
+        pipeline_node=self._downstream_component,
+        mlmd_connection=self._mlmd_connection,
+        pipeline_info=self._pipeline_info,
+        pipeline_runtime_spec=self._pipeline_runtime_spec,
+        executor_spec=self._trainer_executor_spec,
+        custom_executor_operators=self._test_executor_operators,
+    )
+    with self.assertRaisesRegex(ValueError, 'resolving prop error'):
+      test_launcher.launch()

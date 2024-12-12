@@ -17,17 +17,22 @@ import functools
 import os
 import sys
 import click
+from typing import Optional
 
 from google.cloud import aiplatform
 from google.cloud.aiplatform import pipeline_jobs
 
 from tfx.dsl.io import fileio
 from tfx.tools.cli import labels
+from tfx.tools.cli.container_builder import builder
 from tfx.tools.cli.handler import base_handler
-from tfx.tools.cli.handler import kubeflow_handler
 from tfx.tools.cli.handler import kubeflow_v2_dag_runner_patcher
 from tfx.utils import io_utils
 
+def create_container_image(image: str, base_image: Optional[str]) -> str:
+  built_image = builder.build(target_image=image, base_image=base_image)
+  click.echo(f'New container image "{built_image}" was built.')
+  return built_image
 
 class VertexHandler(base_handler.BaseHandler):
   """Helper methods for Vertex Handler."""
@@ -40,7 +45,7 @@ class VertexHandler(base_handler.BaseHandler):
     """
     if self.flags_dict.get(labels.BUILD_IMAGE):
       build_image_fn = functools.partial(
-          kubeflow_handler.create_container_image,
+          create_container_image,
           base_image=self.flags_dict.get(labels.BASE_IMAGE))
     else:
       build_image_fn = None
@@ -117,9 +122,7 @@ class VertexHandler(base_handler.BaseHandler):
         display_name=pipeline_name,
         template_path=self._get_pipeline_definition_path(pipeline_name),
         parameter_values=unparsed_runtime_parameters)
-    # TODO(b/198114641): Delete pytype exception after upgrading source code
-    # to aiplatform>=1.6.2.
-    job.submit()  # pytype: disable=attribute-error
+    job.submit()
 
     click.echo('Run created for pipeline: ' + pipeline_name)
     self._print_run(job)

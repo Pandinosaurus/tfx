@@ -16,7 +16,6 @@
 import os
 from typing import Any, Dict, List
 
-import tensorflow as tf
 from tfx import types
 from tfx.dsl.components.base import base_executor
 from tfx.dsl.io import fileio
@@ -190,10 +189,7 @@ class PythonExecutorOperatorTest(test_case_utils.TfxTest):
                     string_value: "MyPipeline.MyPythonNode.my_model"
                   }
                 }
+                name: "MyPipeline.MyPythonNode.my_model"
               }
             }
           }""", executor_output)
-
-
-if __name__ == '__main__':
-  tf.test.main()

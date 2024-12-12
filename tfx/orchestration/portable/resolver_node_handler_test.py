@@ -16,8 +16,8 @@
 import os
 from unittest import mock
 
-import tensorflow as tf
 from tfx import types
+from tfx import version
 from tfx.dsl.compiler import constants
 from tfx.orchestration import metadata
 from tfx.orchestration.portable import execution_publish_utils
@@ -27,9 +27,8 @@ from tfx.orchestration.portable import runtime_parameter_utils
 from tfx.orchestration.portable.input_resolution import exceptions
 from tfx.orchestration.portable.mlmd import context_lib
 from tfx.proto.orchestration import pipeline_pb2
+from tfx.types import artifact_utils
 from tfx.utils import test_case_utils
-
-from google.protobuf import text_format
 
 
 class ResolverNodeHandlerTest(test_case_utils.TfxTest):
@@ -96,66 +95,29 @@ class ResolverNodeHandlerTest(test_case_utils.TfxTest):
         pipeline_runtime_spec=self._pipeline_runtime_spec)
 
     with self._mlmd_connection as m:
-      # There is no way to directly verify the output artifact of the resolver
-      # So here a fake downstream component is created which listens to the
-      # resolver's output and we verify its input.
-      down_stream_node = text_format.Parse(
-          """
-        inputs {
-          inputs {
-            key: "input_models"
-            value {
-              channels {
-                producer_node_query {
-                  id: "my_resolver"
-                }
-                context_queries {
-                  type {
-                    name: "pipeline"
-                  }
-                  name {
-                    field_value {
-                      string_value: "my_pipeline"
-                    }
-                  }
-                }
-                context_queries {
-                  type {
-                    name: "component"
-                  }
-                  name {
-                    field_value {
-                      string_value: "my_resolver"
-                    }
-                  }
-                }
-                artifact_query {
-                  type {
-                    name: "Model"
-                  }
-                }
-                output_key: "models"
-              }
-              min_count: 1
-            }
-          }
-        }
-        upstream_nodes: "my_resolver"
-        """, pipeline_pb2.PipelineNode())
-      downstream_input_artifacts = inputs_utils.resolve_input_artifacts(
-          metadata_handler=m, node_inputs=down_stream_node.inputs)
-      downstream_input_model = downstream_input_artifacts['input_models']
-      self.assertLen(downstream_input_model, 1)
+      resolved_inputs = inputs_utils.resolve_input_artifacts(
+          metadata_handle=m, pipeline_node=self._my_resolver
+      )
+      self.assertLen(resolved_inputs, 1)
+      self.assertIn('models', resolved_inputs[0])
+      self.assertLen(resolved_inputs[0]['models'], 1)
       self.assertProtoPartiallyEquals(
-          """
+          f"""
           id: 2
           uri: "my_model_uri_2"
-          state: LIVE""",
-          downstream_input_model[0].mlmd_artifact,
+          state: LIVE
+          custom_properties {{
+            key: '{artifact_utils.ARTIFACT_TFX_VERSION_CUSTOM_PROPERTY_KEY}'
+            value {{string_value: "{version.__version__}"}}
+          }}""",
+          resolved_inputs[0]['models'][0].mlmd_artifact,
           ignored_fields=[
-              'type_id', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
       [execution] = m.store.get_executions_by_id([execution_info.execution_id])
 
       self.assertProtoPartiallyEquals(
@@ -165,11 +127,15 @@ class ResolverNodeHandlerTest(test_case_utils.TfxTest):
           """,
           execution,
           ignored_fields=[
-              'type_id', 'create_time_since_epoch',
-              'last_update_time_since_epoch'
-          ])
+              'type_id',
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
-  @mock.patch.object(inputs_utils, 'resolve_input_artifacts_v2')
+  @mock.patch.object(inputs_utils, 'resolve_input_artifacts')
   def testRun_InputResolutionError_ExecutionFailed(self, mock_resolve):
     mock_resolve.side_effect = exceptions.InputResolutionError('Meh')
     handler = resolver_node_handler.ResolverNodeHandler()
@@ -189,11 +155,17 @@ class ResolverNodeHandlerTest(test_case_utils.TfxTest):
           last_known_state: FAILED
           """,
           execution,
-          ignored_fields=['type_id', 'custom_properties',
-                          'create_time_since_epoch',
-                          'last_update_time_since_epoch'])
+          ignored_fields=[
+              'type_id',
+              'type',
+              'custom_properties',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )
 
-  @mock.patch.object(inputs_utils, 'resolve_input_artifacts_v2')
+  @mock.patch.object(inputs_utils, 'resolve_input_artifacts')
   def testRun_MultipleInputs_ExecutionFailed(self, mock_resolve):
     mock_resolve.return_value = inputs_utils.Trigger([
         {'model': [self._create_model_artifact(uri='/tmp/model/1')]},
@@ -216,10 +188,12 @@ class ResolverNodeHandlerTest(test_case_utils.TfxTest):
           last_known_state: FAILED
           """,
           execution,
-          ignored_fields=['type_id', 'custom_properties',
-                          'create_time_since_epoch',
-                          'last_update_time_since_epoch'])
-
-
-if __name__ == '__main__':
-  tf.test.main()
+          ignored_fields=[
+              'type_id',
+              'type',
+              'custom_properties',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+              'name',
+          ],
+      )

@@ -17,12 +17,14 @@ Keep the status codes aligned with `google.rpc.Code`:
 https://github.com/googleapis/googleapis/blob/master/google/rpc/code.proto
 """
 
+import enum
 from typing import Optional
 
 import attr
 
 
-class Code:
+@enum.unique
+class Code(enum.IntEnum):
   """Convenience enum class for status codes that mirrors `google.rpc.Code`.
 
   Keep the status codes aligned with `google.rpc.Code`:
@@ -45,6 +47,26 @@ class Code:
   UNAVAILABLE = 14
   DATA_LOSS = 15
   UNAUTHENTICATED = 16
+
+
+# These are the error codes that are retriable for USER_FACING traffic.
+# See go/stubs-retries.
+USER_FACING_RETRIABLE_STATUS_CODES = frozenset(
+    c.value
+    for c in [
+        Code.UNAVAILABLE,
+    ]
+)
+
+BATCH_RETRIABLE_ERROR_CODES = frozenset(
+    c.value
+    for c in [
+        Code.DEADLINE_EXCEEDED,
+        Code.INTERNAL,
+        Code.UNAVAILABLE,
+        Code.RESOURCE_EXHAUSTED,
+    ]
+)
 
 
 @attr.s(auto_attribs=True, frozen=True)

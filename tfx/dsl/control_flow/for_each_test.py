@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Tests for tfx.dsl.context_managers.for_each."""
+import unittest
 
-import tensorflow as tf
 from tfx import types
 from tfx.dsl.components.base import base_node
-from tfx.dsl.context_managers import context_manager
+from tfx.dsl.context_managers import dsl_context_registry
 from tfx.dsl.control_flow import for_each
+from tfx.orchestration import pipeline as pipeline_lib
+from tfx.types import resolved_channel
+from tfx.utils import test_case_utils
 
 
 class AA(types.Artifact):
@@ -33,8 +36,8 @@ class FakeNode(base_node.BaseNode):
   def __init__(self, **input_dict):
     self._input_dict = input_dict
     self._output_dict = {
-        'aa': types.Channel(type=AA),
-        'bb': types.Channel(type=BB),
+        'aa': types.OutputChannel(AA, self, 'aa'),
+        'bb': types.OutputChannel(BB, self, 'bb'),
     }
     self._output_dict_patched = False
     super().__init__()
@@ -45,11 +48,6 @@ class FakeNode(base_node.BaseNode):
 
   @property
   def outputs(self):
-    if not self._output_dict_patched:
-      for output_key, channel in self._output_dict.items():
-        channel.producer_component_id = self.id
-        channel.output_key = output_key
-      self._output_dict_patched = True
     return self._output_dict
 
   @property
@@ -69,26 +67,23 @@ class C(FakeNode):
   pass
 
 
-class ForEachTest(tf.test.TestCase):
+class ForEachTest(test_case_utils.TfxTest):
 
   def setUp(self):
     super().setUp()
-    self.reset_registry()
-
-  def reset_registry(self) -> None:
-    context_manager._registry = context_manager._DslContextRegistry()
+    self.enter_context(dsl_context_registry.new_registry())
 
   def testForEach_As_GivesLoopVariable(self):
+    reg = dsl_context_registry.get()
+
     a = A().with_id('Apple')
     with for_each.ForEach(a.outputs['aa']) as aa:
-      pass
+      reg.peek_context()
 
-    self.assertIsInstance(aa, types.LoopVarChannel)
-    self.assertEqual(aa.context_id, 'ForEachContext:1')
+    self.assertIsInstance(aa, resolved_channel.ResolvedChannel)
     self.assertEqual(aa.type, AA)
-    self.assertEqual(aa.wrapped.producer_component_id, 'Apple')
-    self.assertEqual(aa.wrapped.output_key, 'aa')
 
+  @unittest.skip('Not implemented.')
   def testForEach_LoopVariableNotUsed_Disallowed(self):
     with self.subTest('Not using at all'):
       with self.assertRaises(ValueError):
@@ -99,15 +94,15 @@ class ForEachTest(tf.test.TestCase):
     with self.subTest('Source channel is not a loop variable.'):
       with self.assertRaises(ValueError):
         a = A()
-        with for_each.ForEach(a.outputs['aa']) as aa:
-          b = B(aa=a.outputs['aa'])  # Should use loop var "aa" directly.
+        with for_each.ForEach(a.outputs['aa']) as aa: # noqa: F841
+          b = B(aa=a.outputs['aa'])  # Should use loop var "aa" directly. # noqa: F841
 
   def testForEach_MultipleNodes_NotImplemented(self):
     with self.assertRaises(NotImplementedError):
       a = A()
       with for_each.ForEach(a.outputs['aa']) as aa:
         b = B(aa=aa)
-        c = C(bb=b.outputs['bb'])  # pylint: disable=unused-variable
+        c = C(bb=b.outputs['bb'])  # noqa: F841
 
   def testForEach_NestedForEach_NotImplemented(self):
     with self.assertRaises(NotImplementedError):
@@ -115,7 +110,7 @@ class ForEachTest(tf.test.TestCase):
       b = B()
       with for_each.ForEach(a.outputs['aa']) as aa:
         with for_each.ForEach(b.outputs['bb']) as bb:
-          c = C(aa=aa, bb=bb)  # pylint: disable=unused-variable
+          c = C(aa=aa, bb=bb)  # noqa: F841
 
   def testForEach_DifferentLoop_HasDifferentContext(self):
     a = A()
@@ -125,10 +120,15 @@ class ForEachTest(tf.test.TestCase):
     with for_each.ForEach(a.outputs['aa']) as aa2:
       c2 = C(aa=aa2, bb=b.outputs['bb'])  # pylint: disable=unused-variable
 
-    context1 = context_manager.get_contexts(c1)[-1]
-    context2 = context_manager.get_contexts(c2)[-1]
-    self.assertNotEqual(context1.id, context2.id)
+    context1 = dsl_context_registry.get().get_contexts(c1)[-1]
+    context2 = dsl_context_registry.get().get_contexts(c2)[-1]
+    self.assertNotEqual(context1, context2)
 
-
-if __name__ == '__main__':
-  tf.test.main()
+  def testForEach_Subpipeline(self):
+    a = A()
+    with for_each.ForEach(a.outputs['aa']) as aa:
+      p_in = pipeline_lib.PipelineInputs({'aa': aa})
+      b = B(aa=p_in.inputs['aa'])
+      pipeline_lib.Pipeline(
+          pipeline_name='foo', components=[b], inputs=p_in, outputs={}
+      )

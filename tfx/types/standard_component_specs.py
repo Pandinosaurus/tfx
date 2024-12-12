@@ -13,9 +13,12 @@
 # limitations under the License.
 """Component specifications for the standard set of TFX Components."""
 
-import tensorflow_model_analysis as tfma
+from tensorflow_data_validation.anomalies.proto import custom_validation_config_pb2
+from tensorflow_model_analysis import sdk as tfma
 from tfx.proto import bulk_inferrer_pb2
+from tfx.proto import distribution_validator_pb2
 from tfx.proto import evaluator_pb2
+from tfx.proto import example_diff_pb2
 from tfx.proto import example_gen_pb2
 from tfx.proto import infra_validator_pb2
 from tfx.proto import pusher_pb2
@@ -39,6 +42,7 @@ from tfx.types.system_executions import Transform
 SCHEMA_KEY = 'schema'
 EXAMPLES_KEY = 'examples'
 MODEL_KEY = 'model'
+EXTERNAL_MODEL_KEY = 'external_model'
 BLESSING_KEY = 'blessing'
 TRAIN_ARGS_KEY = 'train_args'
 CUSTOM_CONFIG_KEY = 'custom_config'
@@ -50,6 +54,7 @@ EXCLUDE_SPLITS_KEY = 'exclude_splits'
 STATISTICS_KEY = 'statistics'
 # Key for example_validator
 ANOMALIES_KEY = 'anomalies'
+CUSTOM_VALIDATION_CONFIG_KEY = 'custom_validation_config'
 # Key for evaluator
 EVAL_CONFIG_KEY = 'eval_config'
 FEATURE_SLICING_SPEC_KEY = 'feature_slicing_spec'
@@ -57,7 +62,10 @@ FAIRNESS_INDICATOR_THRESHOLDS_KEY = 'fairness_indicator_thresholds'
 EXAMPLE_SPLITS_KEY = 'example_splits'
 MODULE_PATH_KEY = 'module_path'
 BASELINE_MODEL_KEY = 'baseline_model'
+EXTERNAL_BASELINE_MODEL_KEY = 'external_baseline_model'
 EVALUATION_KEY = 'evaluation'
+MODEL_SUBFOLDER_KEY = 'model_subfolder'
+ADD_SPLIT_NAME_KEY = 'add_split_name'
 # Key for infra_validator
 SERVING_SPEC_KEY = 'serving_spec'
 VALIDATION_SPEC_KEY = 'validation_spec'
@@ -66,6 +74,7 @@ REQUEST_SPEC_KEY = 'request_spec'
 TUNER_FN_KEY = 'tuner_fn'
 TUNE_ARGS_KEY = 'tune_args'
 BEST_HYPERPARAMETERS_KEY = 'best_hyperparameters'
+TUNER_RESULTS_KEY = 'tuner_results'
 # Key for bulk_inferer
 MODEL_SPEC_KEY = 'model_spec'
 DATA_SPEC_KEY = 'data_spec'
@@ -77,6 +86,8 @@ INFER_FEATURE_SHAPE_KEY = 'infer_feature_shape'
 SCHEMA_FILE_KEY = 'schema_file'
 # Key for statistics_gen
 STATS_OPTIONS_JSON_KEY = 'stats_options_json'
+SHARDED_STATS_OUTPUT_KEY = 'sharded_stats_output'
+SAMPLE_RATE_BY_SPLIT_KEY = 'sample_rate_by_split'
 # Key for example_gen
 INPUT_BASE_KEY = 'input_base'
 INPUT_CONFIG_KEY = 'input_config'
@@ -90,7 +101,6 @@ INFRA_BLESSING_KEY = 'infra_blessing'
 PUSHED_MODEL_KEY = 'pushed_model'
 # Key for TrainerSpec
 RUN_FN_KEY = 'run_fn'
-TRAINER_FN_KEY = 'trainer_fn'
 BASE_MODEL_KEY = 'base_model'
 HYPERPARAMETERS_KEY = 'hyperparameters'
 MODEL_RUN_KEY = 'model_run'
@@ -98,6 +108,9 @@ MODEL_RUN_KEY = 'model_run'
 PREPROCESSING_FN_KEY = 'preprocessing_fn'
 STATS_OPTIONS_UPDATER_FN_KEY = 'stats_options_updater_fn'
 FORCE_TF_COMPAT_V1_KEY = 'force_tf_compat_v1'
+# TODO(tatp): Make save_options available in TFlex:
+# tfx/tflex/components/transform.py
+SAVE_OPTIONS_KEY = 'save_options'
 SPLITS_CONFIG_KEY = 'splits_config'
 ANALYZER_CACHE_KEY = 'analyzer_cache'
 TRANSFORMED_EXAMPLES_KEY = 'transformed_examples'
@@ -108,6 +121,17 @@ PRE_TRANSFORM_STATS_KEY = 'pre_transform_stats'
 POST_TRANSFORM_SCHEMA_KEY = 'post_transform_schema'
 POST_TRANSFORM_STATS_KEY = 'post_transform_stats'
 POST_TRANSFORM_ANOMALIES_KEY = 'post_transform_anomalies'
+# Key for example_diff
+BASELINE_EXAMPLES_KEY = 'baseline_examples'
+EXAMPLE_DIFF_CONFIG_KEY = 'example_diff_config'
+EXAMPLE_DIFF_RESULT_KEY = 'example_diff_result'
+INCLUDE_SPLIT_PAIRS_KEY = 'include_split_pairs'
+# Key for distribution_validator
+BASELINE_STATISTICS_KEY = 'baseline_statistics'
+DISTRIBUTION_VALIDATOR_CONFIG_KEY = 'distribution_validator_config'
+VALIDATION_METRICS_KEY = 'validation_metrics'
+ARTIFACT_DISTRIBUTION_VALIDATOR_CONFIG_KEY = (
+        'artifact_distribution_validator_config')
 
 
 class BulkInferrerSpec(ComponentSpec):
@@ -144,22 +168,20 @@ class EvaluatorSpec(ComponentSpec):
   """Evaluator component spec."""
 
   PARAMETERS = {
-      EVAL_CONFIG_KEY:
-          ExecutionParameter(type=tfma.EvalConfig, optional=True),
+      EVAL_CONFIG_KEY: ExecutionParameter(type=tfma.EvalConfig, optional=True),
       # TODO(b/181911822): Deprecated, use eval_config.slicing_specs.
-      FEATURE_SLICING_SPEC_KEY:
-          ExecutionParameter(
-              type=evaluator_pb2.FeatureSlicingSpec, optional=True),
+      FEATURE_SLICING_SPEC_KEY: ExecutionParameter(
+          type=evaluator_pb2.FeatureSlicingSpec, optional=True
+      ),
       # This parameter is experimental: its interface and functionality may
       # change at any time.
-      FAIRNESS_INDICATOR_THRESHOLDS_KEY:
-          ExecutionParameter(type=str, optional=True),
-      EXAMPLE_SPLITS_KEY:
-          ExecutionParameter(type=str, optional=True),
-      MODULE_FILE_KEY:
-          ExecutionParameter(type=str, optional=True),
-      MODULE_PATH_KEY:
-          ExecutionParameter(type=str, optional=True),
+      FAIRNESS_INDICATOR_THRESHOLDS_KEY: ExecutionParameter(
+          type=str, optional=True
+      ),
+      EXAMPLE_SPLITS_KEY: ExecutionParameter(type=str, optional=True),
+      ADD_SPLIT_NAME_KEY: ExecutionParameter(type=bool, optional=True),
+      MODULE_FILE_KEY: ExecutionParameter(type=str, optional=True),
+      MODULE_PATH_KEY: ExecutionParameter(type=str, optional=True),
   }
   INPUTS = {
       EXAMPLES_KEY:
@@ -182,7 +204,13 @@ class ExampleValidatorSpec(ComponentSpec):
   """ExampleValidator component spec."""
 
   PARAMETERS = {
-      EXCLUDE_SPLITS_KEY: ExecutionParameter(type=str, optional=True),
+      EXCLUDE_SPLITS_KEY:
+          ExecutionParameter(type=str, optional=True),
+      CUSTOM_VALIDATION_CONFIG_KEY:
+          ExecutionParameter(
+              type=custom_validation_config_pb2.CustomValidationConfig,
+              optional=True,
+              use_proto=True),
   }
   INPUTS = {
       STATISTICS_KEY:
@@ -343,6 +371,8 @@ class StatisticsGenSpec(ComponentSpec):
   PARAMETERS = {
       STATS_OPTIONS_JSON_KEY: ExecutionParameter(type=str, optional=True),
       EXCLUDE_SPLITS_KEY: ExecutionParameter(type=str, optional=True),
+      SHARDED_STATS_OUTPUT_KEY: ExecutionParameter(type=bool, optional=True),
+      SAMPLE_RATE_BY_SPLIT_KEY: ExecutionParameter(type=str, optional=True),
   }
   INPUTS = {
       EXAMPLES_KEY:
@@ -366,7 +396,6 @@ class TrainerSpec(ComponentSpec):
       MODULE_FILE_KEY: ExecutionParameter(type=str, optional=True),
       MODULE_PATH_KEY: ExecutionParameter(type=str, optional=True),
       RUN_FN_KEY: ExecutionParameter(type=str, optional=True),
-      TRAINER_FN_KEY: ExecutionParameter(type=str, optional=True),
       CUSTOM_CONFIG_KEY: ExecutionParameter(type=str, optional=True),
   }
   INPUTS = {
@@ -415,6 +444,8 @@ class TunerSpec(ComponentSpec):
   OUTPUTS = {
       BEST_HYPERPARAMETERS_KEY:
           ChannelParameter(type=standard_artifacts.HyperParameters),
+      TUNER_RESULTS_KEY:
+          ChannelParameter(type=standard_artifacts.TunerResults),
   }
 
 
@@ -471,3 +502,50 @@ class TransformSpec(ComponentSpec):
               type=standard_artifacts.ExampleAnomalies, optional=True)
   }
   TYPE_ANNOTATION = Transform
+
+
+class ExampleDiffSpec(ComponentSpec):
+  """ExampleDiff component spec."""
+  PARAMETERS = {
+      EXAMPLE_DIFF_CONFIG_KEY:
+          ExecutionParameter(
+              type=example_diff_pb2.ExampleDiffConfig, use_proto=True),
+      INCLUDE_SPLIT_PAIRS_KEY:
+          ExecutionParameter(type=str, optional=True),
+  }
+  INPUTS = {
+      EXAMPLES_KEY: ChannelParameter(type=standard_artifacts.Examples),
+      BASELINE_EXAMPLES_KEY: ChannelParameter(type=standard_artifacts.Examples),
+  }
+  OUTPUTS = {
+      EXAMPLE_DIFF_RESULT_KEY:
+          ChannelParameter(type=standard_artifacts.ExamplesDiff),
+  }
+  TYPE_ANNOTATION = Process
+
+
+class DistributionValidatorSpec(ComponentSpec):
+  """DistributionValidator component spec."""
+  PARAMETERS = {
+      INCLUDE_SPLIT_PAIRS_KEY:
+          ExecutionParameter(type=str, optional=True),
+      DISTRIBUTION_VALIDATOR_CONFIG_KEY:
+          ExecutionParameter(
+              type=distribution_validator_pb2.DistributionValidatorConfig,
+              use_proto=True),
+      CUSTOM_VALIDATION_CONFIG_KEY:
+          ExecutionParameter(
+              type=custom_validation_config_pb2.CustomValidationConfig,
+              optional=True,
+              use_proto=True),
+  }
+  INPUTS = {
+      STATISTICS_KEY:
+          ChannelParameter(type=standard_artifacts.ExampleStatistics),
+      BASELINE_STATISTICS_KEY:
+          ChannelParameter(type=standard_artifacts.ExampleStatistics),
+  }
+  OUTPUTS = {
+      ANOMALIES_KEY: ChannelParameter(type=standard_artifacts.ExampleAnomalies),
+  }
+  TYPE_ANNOTATION = Process

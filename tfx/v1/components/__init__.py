@@ -16,6 +16,7 @@
 # Components.
 from tfx.components.bulk_inferrer.component import BulkInferrer
 from tfx.components.evaluator.component import Evaluator
+from tfx.components.example_diff.component import ExampleDiff
 from tfx.components.example_gen.csv_example_gen.component import CsvExampleGen
 from tfx.components.example_gen.import_example_gen.component import ImportExampleGen
 from tfx.components.example_validator.component import ExampleValidator
@@ -33,4 +34,24 @@ from tfx.components.tuner.component import Tuner
 from tfx.components.trainer.fn_args_utils import DataAccessor
 from tfx.components.trainer.fn_args_utils import FnArgs
 from tfx.components.tuner.component import TunerFnResult
+
 # pylint: enable=g-bad-import-order
+__all__ = [
+    "BulkInferrer",
+    "CsvExampleGen",
+    "DataAccessor",
+    "Evaluator",
+    "ExampleDiff",
+    "ExampleValidator",
+    "FnArgs",
+    "ImportExampleGen",
+    "ImportSchemaGen",
+    "InfraValidator",
+    "Pusher",
+    "SchemaGen",
+    "StatisticsGen",
+    "Trainer",
+    "Transform",
+    "Tuner",
+    "TunerFnResult",
+]

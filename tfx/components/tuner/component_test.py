@@ -36,6 +36,8 @@ class TunerTest(tf.test.TestCase):
   def _verify_output(self, tuner):
     self.assertEqual(standard_artifacts.HyperParameters.TYPE_NAME,
                      tuner.outputs['best_hyperparameters'].type_name)
+    self.assertEqual(standard_artifacts.TunerResults.TYPE_NAME,
+                     tuner.outputs['tuner_results'].type_name)
 
   def testConstructWithModuleFile(self):
     tuner = component.Tuner(
@@ -75,7 +77,3 @@ class TunerTest(tf.test.TestCase):
           eval_args=self.eval_args,
           module_file='/path/to/module/file',
           tuner_fn='path.to.tuner_fn')
-
-
-if __name__ == '__main__':
-  tf.test.main()

@@ -13,7 +13,7 @@
 # limitations under the License.
 """Tests for tfx.orchestration.portable.cache_utils."""
 import os
-import tensorflow as tf
+from unittest import mock
 
 from tfx.dsl.io import fileio
 from tfx.orchestration import metadata
@@ -24,6 +24,7 @@ from tfx.proto.orchestration import executable_spec_pb2
 from tfx.proto.orchestration import pipeline_pb2
 from tfx.types import standard_artifacts
 from tfx.utils import test_case_utils
+
 from google.protobuf import text_format
 from ml_metadata.proto import metadata_store_pb2
 
@@ -51,25 +52,28 @@ class CacheUtilsTest(test_case_utils.TfxTest):
         class_path: "my.class.path"
         """, executable_spec_pb2.PythonClassExecutableSpec())
 
-  def _get_cache_context(self,
-                         metadata_handler,
-                         custom_pipeline_node=None,
-                         custom_pipeline_info=None,
-                         executor_spec=None,
-                         custom_input_artifacts=None,
-                         custom_output_artifacts=None,
-                         custom_parameters=None,
-                         custom_module_content=None):
+  def _get_cache_context(
+      self,
+      metadata_handle,
+      custom_pipeline_node=None,
+      custom_pipeline_info=None,
+      executor_spec=None,
+      custom_input_artifacts=None,
+      custom_output_artifacts=None,
+      custom_parameters=None,
+      custom_module_content=None,
+  ):
     with fileio.open(self._module_file_path, 'w+') as f:
       f.write(custom_module_content or self._module_file_content)
     return cache_utils.get_cache_context(
-        metadata_handler,
+        metadata_handle,
         custom_pipeline_node or self._pipeline_node,
         custom_pipeline_info or self._pipeline_info,
         executor_spec=(executor_spec or self._executor_spec),
         input_artifacts=(custom_input_artifacts or self._input_artifacts),
         output_artifacts=(custom_output_artifacts or self._output_artifacts),
-        parameters=(custom_parameters or self._parameters))
+        parameters=(custom_parameters or self._parameters),
+    )
 
   def testGetCacheContext(self):
     with metadata.Metadata(connection_config=self._connection_config) as m:
@@ -79,8 +83,11 @@ class CacheUtilsTest(test_case_utils.TfxTest):
           cache_context,
           context_from_mlmd,
           ignored_fields=[
-              'create_time_since_epoch', 'last_update_time_since_epoch'
-          ])
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
 
   def testGetCacheContextTwiceSameArgs(self):
     with metadata.Metadata(connection_config=self._connection_config) as m:
@@ -166,7 +173,9 @@ class CacheUtilsTest(test_case_utils.TfxTest):
       # Different executor spec will result in new cache context.
       self.assertLen(m.store.get_contexts(), 2)
 
-  def testGetCachedOutputArtifacts(self):
+  @mock.patch(
+      'tfx.orchestration.portable.cache_utils.artifact_utils.verify_artifacts')
+  def testGetCachedOutputArtifacts(self, mock_verify_artifacts):
     # Output artifacts that will be used by the first execution with the same
     # cache key.
     output_model_one = standard_artifacts.Model()
@@ -188,10 +197,12 @@ class CacheUtilsTest(test_case_utils.TfxTest):
     with metadata.Metadata(connection_config=self._connection_config) as m:
       cache_context = context_lib.register_context_if_not_exists(
           m, context_lib.CONTEXT_TYPE_EXECUTION_CACHE, 'cache_key')
-      cached_output = cache_utils.get_cached_outputs(m, cache_context)
+
       # No succeed execution is associate with this context yet, so the cached
       # output is None
+      cached_output = cache_utils.get_cached_outputs(m, cache_context)
       self.assertIsNone(cached_output)
+
       execution_one = execution_publish_utils.register_execution(
           m, metadata_store_pb2.ExecutionType(name='my_type'), [cache_context])
       execution_publish_utils.publish_succeeded_execution(
@@ -203,13 +214,14 @@ class CacheUtilsTest(test_case_utils.TfxTest):
           })
       execution_two = execution_publish_utils.register_execution(
           m, metadata_store_pb2.ExecutionType(name='my_type'), [cache_context])
-      output_artifacts = execution_publish_utils.publish_succeeded_execution(
+      output_artifacts, _ = execution_publish_utils.publish_succeeded_execution(
           m,
           execution_two.id, [cache_context],
           output_artifacts={
               output_models_key: [output_model_three, output_model_four],
               output_examples_key: [output_example_two]
           })
+
       # The cached output got should be the artifacts produced by the most
       # recent execution under the given cache context.
       cached_output = cache_utils.get_cached_outputs(m, cache_context)
@@ -220,20 +232,35 @@ class CacheUtilsTest(test_case_utils.TfxTest):
           cached_output[output_models_key][0].mlmd_artifact,
           output_artifacts[output_models_key][0].mlmd_artifact,
           ignored_fields=[
-              'create_time_since_epoch', 'last_update_time_since_epoch'
-          ])
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
       self.assertProtoPartiallyEquals(
           cached_output[output_models_key][1].mlmd_artifact,
           output_artifacts[output_models_key][1].mlmd_artifact,
           ignored_fields=[
-              'create_time_since_epoch', 'last_update_time_since_epoch'
-          ])
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
       self.assertProtoPartiallyEquals(
           cached_output[output_examples_key][0].mlmd_artifact,
           output_artifacts[output_examples_key][0].mlmd_artifact,
           ignored_fields=[
-              'create_time_since_epoch', 'last_update_time_since_epoch'
-          ])
+              'type',
+              'create_time_since_epoch',
+              'last_update_time_since_epoch',
+          ],
+      )
+
+      # There should again be no cached outputs if the artifacts cannot be
+      # verified as still existing
+      mock_verify_artifacts.side_effect = RuntimeError()
+      cached_output = cache_utils.get_cached_outputs(m, cache_context)
+      self.assertIsNone(cached_output)
 
   def testGetCachedOutputArtifactsForNodesWithNoOuput(self):
     with metadata.Metadata(connection_config=self._connection_config) as m:
@@ -253,7 +280,3 @@ class CacheUtilsTest(test_case_utils.TfxTest):
       # output is not None but an empty dict.
       self.assertIsNotNone(cached_output)
       self.assertEmpty(cached_output)
-
-
-if __name__ == '__main__':
-  tf.test.main()

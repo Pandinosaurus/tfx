@@ -13,11 +13,10 @@
 # limitations under the License.
 """Generic TFX BigQueryExampleGen executor."""
 
+import json
 from typing import Any, Dict, Optional
 
 import apache_beam as beam
-
-from apache_beam.options import value_provider
 from google.cloud import bigquery
 import tensorflow as tf
 
@@ -64,20 +63,21 @@ def _BigQueryToExample(pipeline: beam.Pipeline, exec_properties: Dict[str, Any],
   Returns:
     PCollection of TF examples.
   """
-
-  beam_pipeline_args = exec_properties['_beam_pipeline_args']
-  pipeline_options = beam.options.pipeline_options.PipelineOptions(
-      beam_pipeline_args)
-  # Try to parse the GCP project ID from the beam pipeline options.
-  project = pipeline_options.view_as(
-      beam.options.pipeline_options.GoogleCloudOptions).project
-  if isinstance(project, value_provider.ValueProvider):
-    project = project.get()
+  project = utils.parse_gcp_project(exec_properties['_beam_pipeline_args'])
   converter = _BigQueryConverter(split_pattern, project)
+  big_query_custom_config = None
+  if custom_config_str := exec_properties.get('custom_config'):
+    big_query_custom_config = json.loads(custom_config_str)
 
-  return (pipeline
-          | 'QueryTable' >> utils.ReadFromBigQuery(query=split_pattern)
-          | 'ToTFExample' >> beam.Map(converter.RowToExample))
+  return (
+      pipeline
+      | 'QueryTable'
+      >> utils.ReadFromBigQuery(
+          query=split_pattern,
+          big_query_custom_config=big_query_custom_config,
+      )
+      | 'ToTFExample' >> beam.Map(converter.RowToExample)
+  )
 
 
 class Executor(base_example_gen_executor.BaseExampleGenExecutor):

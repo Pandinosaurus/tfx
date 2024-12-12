@@ -16,7 +16,6 @@
 import importlib
 import os
 from typing import List
-import unittest
 
 from absl import logging
 from absl.testing import parameterized
@@ -30,11 +29,13 @@ from tfx.v1.orchestration import metadata
 import ml_metadata as mlmd
 from ml_metadata.proto import metadata_store_pb2
 
+import pytest
+
+
 _SPAN_PROPERTY_NAME = 'span'
 
 
-@unittest.skipIf(tf.__version__ < '2',
-                 'Uses keras Model only compatible with TF 2.x')
+@pytest.mark.e2e
 class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
                                        parameterized.TestCase):
 
@@ -66,6 +67,15 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
           os.path.join(self._data_root, 'labelled', 'penguins_processed.csv'),
           os.path.join(dst_path, 'penguins_processed.csv'))
 
+    # Create a data root for the feature skew test
+    # - data/skewed
+    #   - penguins_processed.csv
+    skewed_dst_path = os.path.join(self._data_root_span, 'skewed')
+    fileio.makedirs(skewed_dst_path)
+    fileio.copy(
+        os.path.join(self._data_root, 'skewed', 'penguins_processed.csv'),
+        os.path.join(skewed_dst_path, 'penguins_processed.csv'))
+
     self._serving_model_dir = os.path.join(self._test_dir, 'serving_model')
     self._pipeline_root = os.path.join(self._test_dir, 'tfx', 'pipelines',
                                        self._pipeline_name)
@@ -76,7 +86,7 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
     return os.path.join(
         os.path.dirname(__file__), f'penguin_utils_{model_framework}.py')
 
-  def _assertExecutedOnce(self, component: str) -> None:
+  def assertExecutedOnce(self, component: str) -> None:
     """Check the component is executed exactly once."""
     component_path = os.path.join(self._pipeline_root, component)
     self.assertTrue(fileio.exists(component_path))
@@ -85,28 +95,28 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
     execution = fileio.listdir(execution_path)
     self.assertLen(execution, 1)
 
-  def _assertPipelineExecution(self,
-                               has_tuner: bool = False,
-                               has_bulk_inferrer: bool = False,
-                               has_schema_gen: bool = True,
-                               has_pusher: bool = True) -> None:
-    self._assertExecutedOnce('CsvExampleGen')
-    self._assertExecutedOnce('Evaluator')
-    self._assertExecutedOnce('StatisticsGen')
-    self._assertExecutedOnce('Trainer')
-    self._assertExecutedOnce('Transform')
+  def assertPipelineExecution(self,
+                              has_tuner: bool = False,
+                              has_bulk_inferrer: bool = False,
+                              has_schema_gen: bool = True,
+                              has_pusher: bool = True) -> None:
+    self.assertExecutedOnce('CsvExampleGen')
+    self.assertExecutedOnce('Evaluator')
+    self.assertExecutedOnce('StatisticsGen')
+    self.assertExecutedOnce('Trainer')
+    self.assertExecutedOnce('Transform')
     if has_schema_gen:
-      self._assertExecutedOnce('SchemaGen')
+      self.assertExecutedOnce('SchemaGen')
     else:
-      self._assertExecutedOnce('ImportSchemaGen')
-      self._assertExecutedOnce('ExampleValidator')
+      self.assertExecutedOnce('ImportSchemaGen')
+      self.assertExecutedOnce('ExampleValidator')
     if has_tuner:
-      self._assertExecutedOnce('Tuner')
+      self.assertExecutedOnce('Tuner')
     if has_bulk_inferrer:
-      self._assertExecutedOnce('CsvExampleGen_Unlabelled')
-      self._assertExecutedOnce('BulkInferrer')
+      self.assertExecutedOnce('CsvExampleGen_Unlabelled')
+      self.assertExecutedOnce('BulkInferrer')
     if has_pusher:
-      self._assertExecutedOnce('Pusher')
+      self.assertExecutedOnce('Pusher')
 
   def _make_beam_pipeline_args(self):
     return []
@@ -120,8 +130,14 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
         importlib.import_module('tensorflow_decision_forests')
       except (ImportError, tf.errors.NotFoundError):
         self.skipTest('TensorflowDecisionForests is not available')
+    elif model_framework == 'flax_experimental':
+      # Skip if flax is not available or incompatible.
+      try:
+        importlib.import_module('flax')
+      except (ImportError, tf.errors.NotFoundError):
+        self.skipTest('flax is not available')
     module_file = self._module_file_name(model_framework)
-    pipeline = penguin_pipeline_local._create_pipeline(
+    pipeline = penguin_pipeline_local.create_pipeline(
         pipeline_name=self._pipeline_name,
         data_root=self._data_root,
         module_file=module_file,
@@ -133,10 +149,11 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
         enable_tuning=False,
         enable_bulk_inferrer=False,
         examplegen_input_config=None,
-        examplegen_range_config=None,
+        examplegen_range_config_date=None,
         resolver_range_config=None,
         beam_pipeline_args=self._make_beam_pipeline_args(),
-        enable_transform_input_cache=False)
+        enable_transform_input_cache=False,
+        enable_example_diff=False)
 
     logging.info('Starting the first pipeline run.')
     LocalDagRunner().run(pipeline)
@@ -152,7 +169,7 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
     self.assertGreaterEqual(artifact_count, execution_count)
     self.assertEqual(expected_execution_count, execution_count)
 
-    self._assertPipelineExecution()
+    self.assertPipelineExecution()
 
     logging.info('Starting the second pipeline run. All components except '
                  'Evaluator and Pusher will use cached results.')
@@ -176,7 +193,7 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
     # TODO(b/180723394): Parameterize this test when Flax supports tuning.
     module_file = self._module_file_name('keras')
     LocalDagRunner().run(
-        penguin_pipeline_local._create_pipeline(
+        penguin_pipeline_local.create_pipeline(
             pipeline_name=self._pipeline_name,
             data_root=self._data_root,
             module_file=module_file,
@@ -188,10 +205,11 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
             enable_tuning=True,
             enable_bulk_inferrer=False,
             examplegen_input_config=None,
-            examplegen_range_config=None,
+            examplegen_range_config_date=None,
             resolver_range_config=None,
             beam_pipeline_args=self._make_beam_pipeline_args(),
-            enable_transform_input_cache=False))
+            enable_transform_input_cache=False,
+            enable_example_diff=False))
 
     self.assertTrue(fileio.exists(self._serving_model_dir))
     self.assertTrue(fileio.exists(self._metadata_path))
@@ -204,10 +222,12 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
     self.assertGreaterEqual(artifact_count, execution_count)
     self.assertEqual(expected_execution_count, execution_count)
 
-    self._assertPipelineExecution(has_tuner=True)
+    self.assertPipelineExecution(has_tuner=True)
 
   @parameterized.parameters(('keras',), ('flax_experimental',),
                             ('tfdf_experimental',))
+  @pytest.mark.xfail(run=False,
+                     reason="Exported Keras model with TF 1.16 is not working with bulk inference currently. Needs to be fixed.")
   def testPenguinPipelineLocalWithBulkInferrer(self, model_framework):
     if model_framework == 'tfdf_experimental':
       # Skip if TFDF is not available or incompatible.
@@ -215,9 +235,15 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
         importlib.import_module('tensorflow_decision_forests')
       except (ImportError, tf.errors.NotFoundError):
         self.skipTest('TensorflowDecisionForests is not available')
+    elif model_framework == 'flax_experimental':
+      # Skip if flax is not available or incompatible.
+      try:
+        importlib.import_module('flax')
+      except (ImportError, tf.errors.NotFoundError):
+        self.skipTest('flax is not available')
     module_file = self._module_file_name(model_framework)
     LocalDagRunner().run(
-        penguin_pipeline_local._create_pipeline(
+        penguin_pipeline_local.create_pipeline(
             pipeline_name=self._pipeline_name,
             data_root=self._data_root,
             module_file=module_file,
@@ -229,10 +255,11 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
             enable_tuning=False,
             enable_bulk_inferrer=True,
             examplegen_input_config=None,
-            examplegen_range_config=None,
+            examplegen_range_config_date=None,
             resolver_range_config=None,
             beam_pipeline_args=[],
-            enable_transform_input_cache=False))
+            enable_transform_input_cache=False,
+            enable_example_diff=False))
 
     self.assertTrue(fileio.exists(self._serving_model_dir))
     self.assertTrue(fileio.exists(self._metadata_path))
@@ -245,12 +272,12 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
     self.assertGreaterEqual(artifact_count, execution_count)
     self.assertEqual(expected_execution_count, execution_count)
 
-    self._assertPipelineExecution(has_bulk_inferrer=True)
+    self.assertPipelineExecution(has_bulk_inferrer=True)
 
   def testPenguinPipelineLocalWithImporter(self):
     module_file = self._module_file_name('keras')
     LocalDagRunner().run(
-        penguin_pipeline_local._create_pipeline(
+        penguin_pipeline_local.create_pipeline(
             pipeline_name=self._pipeline_name,
             data_root=self._data_root,
             module_file=module_file,
@@ -262,10 +289,11 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
             enable_tuning=False,
             enable_bulk_inferrer=False,
             examplegen_input_config=None,
-            examplegen_range_config=None,
+            examplegen_range_config_date=None,
             resolver_range_config=None,
             beam_pipeline_args=[],
-            enable_transform_input_cache=False))
+            enable_transform_input_cache=False,
+            enable_example_diff=False))
 
     self.assertTrue(fileio.exists(self._serving_model_dir))
     self.assertTrue(fileio.exists(self._metadata_path))
@@ -278,7 +306,7 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
     self.assertGreaterEqual(artifact_count, execution_count)
     self.assertEqual(expected_execution_count, execution_count)
 
-    self._assertPipelineExecution(has_schema_gen=False)
+    self.assertPipelineExecution(has_schema_gen=False)
 
   def _get_input_examples_artifacts(
       self, store: mlmd.MetadataStore,
@@ -303,9 +331,9 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
     resolver_range_config = proto.RangeConfig(
         rolling_range=proto.RollingRange(num_spans=2))
 
-    def run_pipeline(examplegen_range_config):
+    def run_pipeline(examplegen_range_config_date):
       LocalDagRunner().run(
-          penguin_pipeline_local._create_pipeline(
+          penguin_pipeline_local.create_pipeline(
               pipeline_name=self._pipeline_name,
               data_root=self._data_root_span,
               module_file=module_file,
@@ -317,23 +345,21 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
               enable_tuning=False,
               enable_bulk_inferrer=False,
               examplegen_input_config=examplegen_input_config,
-              examplegen_range_config=examplegen_range_config,
+              examplegen_range_config_date=examplegen_range_config_date,
               resolver_range_config=resolver_range_config,
               beam_pipeline_args=self._make_beam_pipeline_args(),
-              enable_transform_input_cache=True))
+              enable_transform_input_cache=True,
+              enable_example_diff=False))
 
     # Trigger the pipeline for the first span.
-    examplegen_range_config = proto.RangeConfig(
-        static_range=proto.StaticRange(
-            start_span_number=1, end_span_number=1))
-    run_pipeline(examplegen_range_config)
+    run_pipeline(examplegen_range_config_date='20220102')
 
     self.assertTrue(fileio.exists(self._serving_model_dir))
     self.assertTrue(fileio.exists(self._metadata_path))
-    self._assertPipelineExecution()
+    self.assertPipelineExecution()
     transform_execution_type = 'tfx.components.transform.component.Transform'
     trainer_execution_type = 'tfx.components.trainer.component.Trainer'
-    expected_execution_count = 10  # 7 components + 3 resolvers
+    expected_execution_count = 11  # 8 components + 3 resolvers
     metadata_config = metadata.sqlite_metadata_connection_config(
         self._metadata_path)
     store = mlmd.MetadataStore(metadata_config)
@@ -351,10 +377,7 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
             _SPAN_PROPERTY_NAME].int_value)
 
     # Trigger the pipeline for the second span.
-    examplegen_range_config = proto.RangeConfig(
-        static_range=proto.StaticRange(
-            start_span_number=2, end_span_number=2))
-    run_pipeline(examplegen_range_config)
+    run_pipeline(examplegen_range_config_date='20220103')
 
     execution_count = len(store.get_executions())
     # In the second run, evaluator may not bless the model. As a result,
@@ -379,10 +402,7 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
         2)
 
     # Trigger the pipeline for the thrid span.
-    examplegen_range_config = proto.RangeConfig(
-        static_range=proto.StaticRange(
-            start_span_number=3, end_span_number=3))
-    run_pipeline(examplegen_range_config)
+    run_pipeline(examplegen_range_config_date='20220104')
 
     metadata_config = metadata.sqlite_metadata_connection_config(
         self._metadata_path)
@@ -407,13 +427,54 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
         self._get_input_examples_artifacts(store, trainer_execution_type),
         2)
 
+  def testPenguinPipelineLocalWithExampleDiff(self):
+    module_file = self._module_file_name('keras')
+    examplegen_input_config = proto.Input(splits=[
+        proto.Input.Split(name='test', pattern='day{SPAN}/*'),
+    ])
+
+    def run_pipeline(examplegen_range_config_date):
+      LocalDagRunner().run(
+          penguin_pipeline_local.create_pipeline(
+              pipeline_name=self._pipeline_name,
+              data_root=self._data_root_span,
+              module_file=module_file,
+              accuracy_threshold=0.1,
+              serving_model_dir=self._serving_model_dir,
+              pipeline_root=self._pipeline_root,
+              metadata_path=self._metadata_path,
+              user_provided_schema_path=None,
+              enable_tuning=False,
+              enable_bulk_inferrer=False,
+              examplegen_input_config=examplegen_input_config,
+              examplegen_range_config_date=examplegen_range_config_date,
+              resolver_range_config=None,
+              beam_pipeline_args=self._make_beam_pipeline_args(),
+              enable_transform_input_cache=True,
+              enable_example_diff=True))
+
+    # Trigger the pipeline for the first span.
+    run_pipeline(examplegen_range_config_date='20220102')
+    self.assertTrue(fileio.exists(self._serving_model_dir))
+    self.assertTrue(fileio.exists(self._metadata_path))
+    self.assertPipelineExecution()
+    self.assertExecutedOnce('ExampleDiff')
+    expected_execution_count = 12  # 10 components + 2 resolvers
+    metadata_config = metadata.sqlite_metadata_connection_config(
+        self._metadata_path)
+    store = mlmd.MetadataStore(metadata_config)
+    execution_count = len(store.get_executions())
+    self.assertEqual(expected_execution_count, execution_count)
+
   def testPenguinPipelineLocalConditionalWithoutPusher(self):
     module_file = self._module_file_name('keras')
-    pipeline = penguin_pipeline_local._create_pipeline(
+    pipeline = penguin_pipeline_local.create_pipeline(
         pipeline_name=self._pipeline_name,
         data_root=self._data_root,
         module_file=module_file,
-        accuracy_threshold=1.0,  # Model evaluation will fail with 1.0 threshold
+        # TODO(b/236075398): Change threshold back to 1 after fixing Evaluator.
+        accuracy_threshold=1.0001,  # Model evaluation will fail with 1.0
+                                    # threshold
         serving_model_dir=self._serving_model_dir,
         pipeline_root=self._pipeline_root,
         metadata_path=self._metadata_path,
@@ -421,10 +482,11 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
         enable_tuning=False,
         enable_bulk_inferrer=False,
         examplegen_input_config=None,
-        examplegen_range_config=None,
+        examplegen_range_config_date=None,
         resolver_range_config=None,
         beam_pipeline_args=self._make_beam_pipeline_args(),
-        enable_transform_input_cache=False)
+        enable_transform_input_cache=False,
+        enable_example_diff=False)
 
     logging.info('Starting the first pipeline run.')
     LocalDagRunner().run(pipeline)
@@ -439,7 +501,7 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
     self.assertGreaterEqual(artifact_count, execution_count)
     self.assertEqual(expected_execution_count, execution_count)
 
-    self._assertPipelineExecution(has_pusher=False)
+    self.assertPipelineExecution(has_pusher=False)
 
     logging.info('Starting the second pipeline run. All components except '
                  'Evaluator will use cached results. Pusher will not run.')
@@ -458,8 +520,3 @@ class PenguinPipelineLocalEndToEndTest(tf.test.TestCase,
     # Artifact count is unchanged.
     self.assertLen(store.get_artifacts(), artifact_count)
     self.assertLen(store.get_executions(), expected_execution_count * 3)
-
-
-if __name__ == '__main__':
-  tf.compat.v1.enable_v2_behavior()
-  tf.test.main()

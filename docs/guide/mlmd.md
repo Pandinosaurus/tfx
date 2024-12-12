@@ -8,9 +8,9 @@ that it can be used independently.
 
 Every run of a production ML pipeline generates metadata containing information
 about the various pipeline components, their executions (e.g. training runs),
-and resulting artifacts(e.g. trained models). In the event of unexpected
+and resulting artifacts (e.g. trained models). In the event of unexpected
 pipeline behavior or errors, this metadata can be leveraged to analyze the
-lineage of pipeline components and debug issues.Think of this metadata as the
+lineage of pipeline components and debug issues. Think of this metadata as the
 equivalent of logging in software development.
 
 MLMD helps you understand and analyze all the interconnected parts of your ML
@@ -84,8 +84,8 @@ connection_config.mysql.password = '...'
 store = metadata_store.MetadataStore(connection_config)
 ```
 
-Similarly, when using a MySQL instance with Google
-CloudSQL([quickstart](https://cloud.google.com/sql/docs/mysql/quickstart),
+Similarly, when using a MySQL instance with Google CloudSQL
+([quickstart](https://cloud.google.com/sql/docs/mysql/quickstart),
 [connect-overview](https://cloud.google.com/sql/docs/mysql/connect-overview)),
 one could also use SSL option if applicable.
 
@@ -96,6 +96,32 @@ connection_config.mysql.ssl_options.ca = '...'
 connection_config.mysql.ssl_options.capath = '...'
 connection_config.mysql.ssl_options.cipher = '...'
 connection_config.mysql.ssl_options.verify_server_cert = '...'
+store = metadata_store.MetadataStore(connection_config)
+```
+
+*   **PostgreSQL** connects to a PostgreSQL server.
+
+```python
+connection_config = metadata_store_pb2.ConnectionConfig()
+connection_config.postgresql.host = '...'
+connection_config.postgresql.port = '...'
+connection_config.postgresql.user = '...'
+connection_config.postgresql.password = '...'
+connection_config.postgresql.dbname = '...'
+store = metadata_store.MetadataStore(connection_config)
+```
+
+Similarly, when using a PostgreSQL instance with Google CloudSQL
+([quickstart](https://cloud.google.com/sql/docs/postgres/quickstart),
+[connect-overview](https://cloud.google.com/sql/docs/postgres/connect-overview)),
+one could also use SSL option if applicable.
+
+```python
+connection_config.postgresql.ssloption.sslmode = '...' # disable, allow, verify-ca, verify-full, etc.
+connection_config.postgresql.ssloption.sslcert = '...'
+connection_config.postgresql.ssloption.sslkey = '...'
+connection_config.postgresql.ssloption.sslpassword = '...'
+connection_config.postgresql.ssloption.sslrootcert = '...'
 store = metadata_store.MetadataStore(connection_config)
 ```
 
@@ -165,7 +191,7 @@ following list provides a non-exhaustive overview of some of the major benefits.
     within a range; find previous executions in a context with the same inputs.
 
 See the
-[MLMD tutorial](https://www.tensorflow.org/tfx/tutorials/mlmd/mlmd_tutorial) for
+[MLMD tutorial](../../tutorials/mlmd/mlmd_tutorial) for
 an example that shows you how to use the MLMD API and the metadata store to
 retrieve lineage information.
 
@@ -413,7 +439,7 @@ to learn how to use MLMD declarative nodes filtering capabilities on properties
 and 1-hop neighborhood nodes.
 
 Also check out the
-[MLMD tutorial](https://www.tensorflow.org/tfx/tutorials/mlmd/mlmd_tutorial) to
+[MLMD tutorial](../../tutorials/mlmd/mlmd_tutorial) to
 learn how to use MLMD to trace the lineage of your pipeline components.
 
 MLMD provides utilities to handle schema and data migrations across releases.

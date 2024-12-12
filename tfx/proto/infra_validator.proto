@@ -92,6 +92,8 @@ message LocalDockerConfig {
   // Optional docker client timeout seconds. Default to the constant defined in
   // docker-py library.
   int32 client_timeout_seconds = 3;
+  // Optional host ip address. If not specified, then uses "localhost".
+  string host_ip_address = 4;
 }
 
 // Kubernetes configuration. We currently only support the use case when infra
@@ -134,6 +136,10 @@ message PodOverrides {
   // Optional.
   // Environment variables to apply to the pod's Container.
   repeated EnvVar env = 2;
+
+  // Optional.
+  // Pod resources (cpu, memory).
+  Resources resources = 3;
 }
 
 // https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/V1EnvVar.md
@@ -177,6 +183,13 @@ message SecretKeySelector {
   string name = 1;
   // The key of the secret to select from.  Must be a valid secret key.
   string key = 2;
+}
+
+// https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/V1ResourceRequirements.md
+message Resources {
+  map<string, string> requests = 1;
+  map<string, string> limits = 2;
+  map<string, string> claims = 3;
 }
 
 // Specification for validation criteria and thresholds.

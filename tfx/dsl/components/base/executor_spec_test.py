@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for tfx.dsl.components.base.executor_spec."""
 
+
 import tensorflow as tf
 from tfx.dsl.components.base import base_executor
 from tfx.dsl.components.base import executor_spec
@@ -25,6 +26,10 @@ class _TestSpecWithoutEncode(executor_spec.ExecutorSpec):
     return self
 
 
+class _DummyExecutor(base_executor.BaseExecutor):
+  pass
+
+
 class ExecutorSpecTest(tf.test.TestCase):
 
   def testNotImplementedError(self):
@@ -34,25 +39,19 @@ class ExecutorSpecTest(tf.test.TestCase):
       _TestSpecWithoutEncode().encode()
 
   def testExecutorClassSpecCopy(self):
-    class _NestedExecutor(base_executor.BaseExecutor):
-      pass
-    spec = executor_spec.ExecutorClassSpec(_NestedExecutor)
+    spec = executor_spec.ExecutorClassSpec(_DummyExecutor)
     spec.add_extra_flags('a')
     spec_copy = spec.copy()
     del spec
     self.assertProtoEquals(
         """
-        class_path: "__main__._NestedExecutor"
+        class_path: "tfx.dsl.components.base.executor_spec_test._DummyExecutor"
         extra_flags: "a"
         """,
         spec_copy.encode())
 
   def testBeamExecutorSpecCopy(self):
-
-    class _NestedExecutor(base_executor.BaseExecutor):
-      pass
-
-    spec = executor_spec.BeamExecutorSpec(_NestedExecutor)
+    spec = executor_spec.BeamExecutorSpec(_DummyExecutor)
     spec.add_extra_flags('a')
     spec.add_beam_pipeline_args('b')
     spec_copy = spec.copy()
@@ -60,10 +59,15 @@ class ExecutorSpecTest(tf.test.TestCase):
     self.assertProtoEquals(
         """
         python_executor_spec: {
-            class_path: "__main__._NestedExecutor"
+            class_path: "tfx.dsl.components.base.executor_spec_test._DummyExecutor"
             extra_flags: "a"
         }
         beam_pipeline_args: "b"
+        beam_pipeline_args_placeholders {
+          value {
+            string_value: "b"
+          }
+        }
         """, spec_copy.encode())
 
   def testExecutorContainerSpecCopy(self):
@@ -74,6 +78,3 @@ class ExecutorSpecTest(tf.test.TestCase):
     self.assertEqual(spec_copy.image, 'path/to:image')
     self.assertEqual(spec_copy.command, ['command'])
     self.assertEqual(spec_copy.args, ['args'])
-
-if __name__ == '__main__':
-  tf.test.main()

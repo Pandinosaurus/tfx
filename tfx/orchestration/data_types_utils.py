@@ -15,6 +15,7 @@
 from typing import Dict, Iterable, List, Mapping, Optional
 
 from tfx import types
+from tfx.proto.orchestration import execution_result_pb2
 from tfx.proto.orchestration import pipeline_pb2
 from tfx.types import artifact_utils
 from tfx.utils import json_utils
@@ -42,6 +43,14 @@ def build_artifact_dict(
   return result
 
 
+def unpack_executor_output_artifacts(
+    executor_output_artifacts: Mapping[
+        str, execution_result_pb2.ExecutorOutput.ArtifactList]
+) -> Dict[str, List[metadata_store_pb2.Artifact]]:
+  """Unpacks the ArtifactList in an Executor's output artifacts mapping."""
+  return {k: list(v.artifacts) for k, v in executor_output_artifacts.items()}
+
+
 def build_artifact_struct_dict(
     artifact_dict: Mapping[str, Iterable[types.Artifact]]
 ) -> Dict[str, metadata_store_service_pb2.ArtifactStructList]:
@@ -62,7 +71,7 @@ def build_artifact_struct_dict(
 
 def build_value_dict(
     metadata_value_dict: Mapping[str, metadata_store_pb2.Value]
-) -> Dict[str, types.Property]:
+) -> Dict[str, types.ExecPropertyTypes]:
   """Converts MLMD value dict into plain value dict."""
   result = {}
   for k, v in metadata_value_dict.items():
@@ -109,8 +118,19 @@ def get_parsed_value(
       value: str, value_type: pipeline_pb2.Value.Schema.ValueType
   ) -> types.ExecPropertyTypes:
     if value_type.HasField('list_type'):
-      list_value = json_utils.loads(value)
-      return [parse_value(val, value_type.list_type) for val in list_value]
+      json_value = json_utils.loads(value)
+      if not isinstance(json_value, list):
+        raise RuntimeError('Expect list type, got %r' % json_value)
+      return [parse_value(val, value_type.list_type) for val in json_value]
+    elif value_type.HasField('dict_type'):
+      json_value = json_utils.loads(value)
+      if not isinstance(json_value, dict):
+        raise RuntimeError('Expect dict type, got %r' % json_value)
+      return {
+          key: parse_value(val, value_type.dict_type)
+          for key, val in json_value.items()
+      }
+
     elif value_type.HasField('proto_type'):
       return proto_utils.deserialize_proto_message(
           value, value_type.proto_type.message_type,
@@ -173,9 +193,11 @@ def get_metadata_value_type(
       return metadata_store_pb2.DOUBLE
     elif value_type == 'string_value':
       return metadata_store_pb2.STRING
+    elif value_type == 'proto_value':
+      return metadata_store_pb2.PROTO
     else:
       raise ValueError('Unexpected value type %s' % value_type)
-  elif isinstance(value, (str, bool, message.Message, list)):
+  elif isinstance(value, (str, bool, message.Message, list, dict)):
     return metadata_store_pb2.STRING
   else:
     raise ValueError('Unexpected value type %s' % type(value))
@@ -274,12 +296,20 @@ def set_parameter_value(
         proto_utils.build_file_descriptor_set(value,
                                               proto_type.file_descriptors)
       return proto_utils.proto_to_json(value)
-    elif isinstance(value, list) and len(value):
+    elif isinstance(value, (list, tuple)):
       if set_schema:
         value_type.list_type.SetInParent()
       value = [
           get_value_and_set_type(val, value_type.list_type) for val in value
       ]
+      return json_utils.dumps(value)
+    elif isinstance(value, dict):
+      if set_schema:
+        value_type.dict_type.SetInParent()
+      value = {
+          key: get_value_and_set_type(val, value_type.dict_type)
+          for key, val in value.items()
+      }
       return json_utils.dumps(value)
     elif isinstance(value, (int, float, str)):
       return value
@@ -300,7 +330,7 @@ def set_parameter_value(
   elif isinstance(value, bool):
     parameter_value.schema.value_type.boolean_type.SetInParent()
     parameter_value.field_value.string_value = json_utils.dumps(value)
-  elif isinstance(value, (list, message.Message)):
+  elif isinstance(value, (list, tuple, dict, message.Message)):
     parameter_value.field_value.string_value = get_value_and_set_type(
         value, parameter_value.schema.value_type)
   else:

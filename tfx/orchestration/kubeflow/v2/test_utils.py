@@ -13,28 +13,33 @@
 # limitations under the License.
 """Test utilities for kubeflow v2 runner."""
 
+import datetime
 import os
 from typing import List
 
 from kfp.pipeline_spec import pipeline_spec_pb2 as pipeline_pb2
 import tensorflow_model_analysis as tfma
 from tfx import v1 as tfx
-from tfx.components.trainer.executor import Executor
+from tfx.components.example_gen import utils
 from tfx.dsl.component.experimental import executor_specs
 from tfx.dsl.component.experimental import placeholders
 from tfx.dsl.components.base import base_component
 from tfx.dsl.components.base import base_executor
 from tfx.dsl.components.base import base_node
 from tfx.dsl.components.base import executor_spec
-from tfx.dsl.experimental.conditionals import conditional
 from tfx.types import channel_utils
 from tfx.types import component_spec
 from tfx.types.experimental import simple_artifacts
+from tfx.utils import proto_utils
 
+from google.protobuf import struct_pb2
 from google.protobuf import message
 
+_ph = tfx.dsl.placeholders
 
 _TEST_TWO_STEP_PIPELINE_NAME = 'two-step-pipeline'
+
+_TEST_TWO_STEP_PIPELINE_WITH_DYNAMIC_EXEC_PROPERTIES_NAME = 'two-step-pipeline-with-dynamic-exec-properties'
 
 _TEST_FULL_PIPELINE_NAME = 'full-taxi-pipeline'
 
@@ -44,13 +49,23 @@ _TEST_INPUT_DATA = 'path/to/my/data'
 
 _TEST_MODULE_FILE_LOCATION = 'path/to/my/module_utils.py'
 
-TEST_RUNTIME_CONFIG = pipeline_pb2.PipelineJob.RuntimeConfig(
+TEST_RUNTIME_CONFIG_LEGACY = pipeline_pb2.PipelineJob.RuntimeConfig(
     gcs_output_directory=_TEST_PIPELINE_ROOT,
     parameters={
         'string_param': pipeline_pb2.Value(string_value='test-string'),
         'int_param': pipeline_pb2.Value(int_value=42),
-        'float_param': pipeline_pb2.Value(double_value=3.14)
-    })
+        'float_param': pipeline_pb2.Value(double_value=3.14),
+    },
+)
+
+TEST_RUNTIME_CONFIG = pipeline_pb2.PipelineJob.RuntimeConfig(
+    gcs_output_directory=_TEST_PIPELINE_ROOT,
+    parameter_values={
+        'string_param': struct_pb2.Value(string_value='test-string'),
+        'int_param': struct_pb2.Value(number_value=42),
+        'float_param': struct_pb2.Value(number_value=3.14),
+    },
+)
 
 
 # TODO(b/158245564): Reevaluate whether to keep this test helper function
@@ -72,8 +87,75 @@ def two_step_pipeline() -> tfx.dsl.Pipeline:
       ])
 
 
-def simple_pipeline_components(csv_input_location: str = ''
-                               ) -> List[base_node.BaseNode]:
+@tfx.dsl.components.component
+def range_config_generator(input_date: tfx.dsl.components.Parameter[str],
+                           range_config: tfx.dsl.components.OutputArtifact[
+                               tfx.types.standard_artifacts.String]):
+  """Implements a function-based TFX component to convert date into a span number for downstream use by ExampleGen.
+
+  Args:
+    input_date: input date to generate range_config.
+    range_config: range_config to ExampleGen.
+  """
+  date = datetime.datetime.strptime(input_date, '%Y%m%d')
+  range_config_str = proto_utils.proto_to_json(
+      tfx.proto.RangeConfig(
+          static_range=tfx.proto.StaticRange(
+              start_span_number=utils.date_to_span_number(1970, 1, 1),
+              end_span_number=utils.date_to_span_number(date.year, date.month,
+                                                        date.day))))
+  range_config.value = range_config_str
+
+
+def two_step_pipeline_with_dynamic_exec_properties():
+  """Returns a simple 2-step pipeline under test with the second component's execution property depending dynamically on the first one's output."""
+
+  input_config_generator = range_config_generator(  # pylint: disable=no-value-for-parameter
+      input_date='22-09-26')
+  example_gen = tfx.extensions.google_cloud_big_query.BigQueryExampleGen(
+      query='SELECT * FROM TABLE',
+      range_config=(
+          input_config_generator.outputs['range_config'].future()[0].value
+      ),
+  ).with_beam_pipeline_args([
+      '--runner=DataflowRunner',
+  ])
+  return tfx.dsl.Pipeline(
+      pipeline_name=_TEST_TWO_STEP_PIPELINE_WITH_DYNAMIC_EXEC_PROPERTIES_NAME,
+      pipeline_root=_TEST_PIPELINE_ROOT,
+      components=[input_config_generator, example_gen],
+      beam_pipeline_args=[
+          '--project=my-gcp-project',
+      ],
+  )
+
+
+def two_step_pipeline_with_illegal_dynamic_exec_property():
+  """Returns a simple 2-step pipeline under test with the second component's execution property declaring an illegally complex placeholder."""
+
+  input_config_generator = range_config_generator(  # pylint: disable=no-value-for-parameter
+      input_date='22-09-26'
+  )
+  example_gen = tfx.extensions.google_cloud_big_query.BigQueryExampleGen(
+      query='SELECT * FROM TABLE',
+      range_config=(
+          input_config_generator.outputs['range_config'].future()[0].value
+          + _ph.execution_invocation().pipeline_run_id
+      ),
+  ).with_beam_pipeline_args([
+      '--runner=DataflowRunner',
+  ])
+  return tfx.dsl.Pipeline(
+      pipeline_name=_TEST_TWO_STEP_PIPELINE_WITH_DYNAMIC_EXEC_PROPERTIES_NAME,
+      pipeline_root=_TEST_PIPELINE_ROOT,
+      components=[input_config_generator, example_gen],
+      beam_pipeline_args=[
+          '--project=my-gcp-project',
+      ])
+
+
+def simple_pipeline_components(
+    csv_input_location: str = '') -> List[base_node.BaseNode]:
   """Creates very basic components for test a pipeline execution.
 
   Args:
@@ -120,7 +202,6 @@ def create_pipeline_components(
         query=bigquery_query)
   else:
     example_gen = tfx.components.CsvExampleGen(input_base=csv_input_location)
-
   statistics_gen = tfx.components.StatisticsGen(
       examples=example_gen.outputs['examples'])
   schema_gen = tfx.components.SchemaGen(
@@ -138,7 +219,6 @@ def create_pipeline_components(
       model=tfx.dsl.Channel(type=tfx.types.standard_artifacts.Model)).with_id(
           'Resolver.latest_model_resolver')
   trainer = tfx.components.Trainer(
-      custom_executor_spec=executor_spec.ExecutorClassSpec(Executor),
       examples=transform.outputs['transformed_examples'],
       schema=schema_gen.outputs['schema'],
       base_model=latest_model_resolver.outputs['model'],
@@ -154,25 +234,28 @@ def create_pipeline_components(
       model_blessing=tfx.dsl.Channel(
           type=tfx.types.standard_artifacts.ModelBlessing)).with_id(
               'Resolver.latest_blessed_model_resolver')
-  # Set the TFMA config for Model Evaluation and Validation.
+  # Uses TFMA to compute a evaluation statistics over features of a model and
+  # perform quality validation of a candidate model (compared to a baseline).
   eval_config = tfma.EvalConfig(
-      model_specs=[tfma.ModelSpec(signature_name='eval')],
-      metrics_specs=[
-          tfma.MetricsSpec(
-              metrics=[tfma.MetricConfig(class_name='ExampleCount')],
-              thresholds={
-                  'binary_accuracy':
-                      tfma.MetricThreshold(
-                          value_threshold=tfma.GenericValueThreshold(
-                              lower_bound={'value': 0.5}),
-                          change_threshold=tfma.GenericChangeThreshold(
-                              direction=tfma.MetricDirection.HIGHER_IS_BETTER,
-                              absolute={'value': -1e-10}))
-              })
+      model_specs=[
+          tfma.ModelSpec(
+              signature_name='serving_default', label_key='tips_xf',
+              preprocessing_function_names=['transform_features'])
       ],
-      slicing_specs=[
-          tfma.SlicingSpec(),
-          tfma.SlicingSpec(feature_keys=['trip_start_hour'])
+      slicing_specs=[tfma.SlicingSpec()],
+      metrics_specs=[
+          tfma.MetricsSpec(metrics=[
+              tfma.MetricConfig(
+                  class_name='BinaryAccuracy',
+                  threshold=tfma.MetricThreshold(
+                      value_threshold=tfma.GenericValueThreshold(
+                          lower_bound={'value': 0.6}),
+                      # Change threshold will be ignored if there is no
+                      # baseline model resolved from MLMD (first run).
+                      change_threshold=tfma.GenericChangeThreshold(
+                          direction=tfma.MetricDirection.HIGHER_IS_BETTER,
+                          absolute={'value': -1e-10})))
+          ])
       ])
   evaluator = tfx.components.Evaluator(
       examples=example_gen.outputs['examples'],
@@ -180,8 +263,9 @@ def create_pipeline_components(
       baseline_model=model_resolver.outputs['model'],
       eval_config=eval_config)
 
-  with conditional.Cond(evaluator.outputs['blessing'].future()
-                        [0].custom_property('blessed') == 1):
+  with tfx.dsl.Cond(
+      evaluator.outputs['blessing'].future()[0].custom_property('blessed') == 1
+  ):
     pusher = tfx.components.Pusher(
         model=trainer.outputs['model'],
         push_destination=tfx.proto.PushDestination(
@@ -322,7 +406,6 @@ dummy_transformer_component = tfx.dsl.experimental.create_container_component(
     ],
 )
 
-
 dummy_exit_handler = tfx.dsl.experimental.create_container_component(
     name='ExitHandlerComponent',
     parameters={
@@ -461,16 +544,29 @@ def pipeline_with_two_container_spec_components_2() -> tfx.dsl.Pipeline:
   )
 
 
-def get_proto_from_test_data(filename: str,
-                             pb_message: message.Message) -> message.Message:
+def get_proto_from_test_data(
+    filename: str, pb_message: message.Message, use_legacy_data: bool = False
+) -> message.Message:
   """Helper function that gets proto from testdata."""
-  filepath = os.path.join(os.path.dirname(__file__), 'testdata', filename)
+  if use_legacy_data:
+    filepath = os.path.join(
+        os.path.dirname(__file__), 'testdata', 'legacy', filename
+    )
+  else:
+    filepath = os.path.join(os.path.dirname(__file__), 'testdata', filename)
   return tfx.utils.parse_pbtxt_file(filepath, pb_message)
 
 
-def get_text_from_test_data(filename: str) -> str:
+def get_text_from_test_data(
+    filename: str, use_legacy_data: bool = False
+) -> str:
   """Helper function that gets raw string from testdata."""
-  filepath = os.path.join(os.path.dirname(__file__), 'testdata', filename)
+  if use_legacy_data:
+    filepath = os.path.join(
+        os.path.dirname(__file__), 'testdata', 'legacy', filename
+    )
+  else:
+    filepath = os.path.join(os.path.dirname(__file__), 'testdata', filename)
   return tfx.dsl.io.fileio.open(filepath, 'rb').read().decode('utf-8')
 
 

@@ -79,6 +79,16 @@ def tfx_workspace():
         name = "com_github_google_ml_metadata",
         repo = "google/ml-metadata",
         # LINT.IfChange
-        tag = "v1.6.0",
+        tag = "v1.16.0",
+        # LINT.ThenChange(//tfx/dependencies.py)
+    )
+
+    # Fetch TFMD repo from GitHub.
+    tfx_github_archive(
+        name = "com_github_tf_metadata",
+        repo = "tensorflow/metadata",
+        # LINT.IfChange
+        # Keep in sync with TFDV version (TFDV requires TFMD).
+        tag = "v1.16.1",
         # LINT.ThenChange(//tfx/dependencies.py)
     )

@@ -33,6 +33,14 @@ from ml_metadata.proto import metadata_store_pb2
 from tensorflow_metadata.proto.v0 import anomalies_pb2
 
 
+try:
+  # Try to access EvalResult from tfma directly
+  _EvalResult = tfma.EvalResult
+except AttributeError:
+  # If tfma doesn't have EvalResult, use the one from view_types
+  from tensorflow_model_analysis.view.view_types import EvalResult as _EvalResult
+
+
 def compare_dirs(dir1: str, dir2: str):
   """Recursively compares contents of the two directories.
 
@@ -159,7 +167,7 @@ def verify_file_dir(output_uri: str,
 
 
 def _group_metric_by_slice(
-    eval_result: tfma.EvalResult) -> Dict[str, Dict[str, float]]:
+    eval_result: _EvalResult) -> Dict[str, Dict[str, float]]:
   """Returns a dictionary holding metric values for every slice.
 
   Args:
@@ -268,6 +276,8 @@ def compare_model_file_sizes(output_uri: str, expected_uri: str,
 def compare_anomalies(output_uri: str, expected_uri: str) -> bool:
   """Compares anomalies files in output uri and recorded uri.
 
+  Looks at only binary proto files.
+
   Args:
     output_uri: pipeline output artifact uri.
     expected_uri: recorded pipeline output artifact uri.
@@ -277,6 +287,9 @@ def compare_anomalies(output_uri: str, expected_uri: str) -> bool:
   """
   for dir_name, _, leaf_files in fileio.walk(expected_uri):
     for leaf_file in leaf_files:
+      if not leaf_file.endswith('.pb'):
+        # Do not analyze non-binary-proto files.
+        continue
       expected_file_name = os.path.join(dir_name, leaf_file)
       file_name = os.path.join(
           dir_name.replace(expected_uri, output_uri, 1), leaf_file)

@@ -1,3 +1,5 @@
+load("//tfx:tfx.bzl", "tfx_py_proto_library")
+
 # Copyright 2020 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,8 +18,6 @@ package(default_visibility = ["//visibility:public"])
 licenses(["notice"])  # Apache 2.0
 
 exports_files(["LICENSE"])
-
-load("//tfx:tfx.bzl", "tfx_py_proto_library")
 
 tfx_py_proto_library(
     name = "execution_result_py_pb2",
@@ -38,9 +38,15 @@ tfx_py_proto_library(
 )
 
 tfx_py_proto_library(
+    name = "garbage_collection_policy_py_pb2",
+    srcs = ["garbage_collection_policy.proto"],
+)
+
+tfx_py_proto_library(
     name = "pipeline_py_pb2",
     srcs = ["pipeline.proto"],
     deps = [
+        ":garbage_collection_policy_py_pb2",
         ":placeholder_py_pb2",
         "@com_github_google_ml_metadata//ml_metadata/proto:metadata_store_py_pb2",
     ],
@@ -89,6 +95,15 @@ tfx_py_proto_library(
     srcs = ["execution_watcher.proto"],
     use_grpc_plugin = True,
     deps = [
+        "@com_github_google_ml_metadata//ml_metadata/proto:metadata_store_py_pb2",
+    ],
+)
+
+tfx_py_proto_library(
+    name = "execution_hook_py_pb2",
+    srcs = ["execution_hook.proto"],
+    deps = [
+        ":placeholder_py_pb2",
         "@com_github_google_ml_metadata//ml_metadata/proto:metadata_store_py_pb2",
     ],
 )

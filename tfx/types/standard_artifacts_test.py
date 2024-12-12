@@ -13,12 +13,15 @@
 # limitations under the License.
 """Tests for standard TFX Artifact types."""
 
+
 import math
+from typing import Any, Dict
 from unittest import mock
 
 import absl
 import tensorflow as tf
 from tfx.types import standard_artifacts
+from tfx.utils import json_utils
 
 # Define constant value for tests.
 _TEST_BYTE_RAW = b'hello world'
@@ -38,6 +41,36 @@ _TEST_FLOAT_DECODED = 3.1415926535
 
 _TEST_FLOAT128_RAW = b'3.14159265358979323846264338327950288'
 _TEST_FLOAT128 = 3.14159265358979323846264338327950288  # Too precise
+
+_TEST_JSONVALUE_LIST_RAW = '[42, 42.0]'
+_TEST_JSONVALUE_LIST_DECODED = [42, 42.0]
+
+_TEST_JSONVALUE_DICT_RAW = '{\"x\": 42}'
+_TEST_JSONVALUE_DICT_DECODED = {'x': 42}
+
+
+class TfxTestJsonableCls(json_utils.Jsonable):
+  """A test class that implements the Jsonable interface."""
+
+  def __init__(self, x):
+    self._x = x
+
+  def to_json_dict(self) -> Dict[str, Any]:
+    return {'x': self._x}
+
+  @classmethod
+  def from_json_dict(cls, dict_data: Dict[str, Any]) -> 'TfxTestJsonableCls':
+    return TfxTestJsonableCls(dict_data['x'])
+
+  def __eq__(self, other):
+    return isinstance(other, TfxTestJsonableCls) and other._x == self._x
+
+
+_TEST_JSONVALUE_OBJ_RAW = (
+    '{\"__class__\": \"TfxTestJsonableCls\", \"__module__\":'
+    ' \"tfx.types.standard_artifacts_test\", \"__tfx_object_type__\": '
+    '\"jsonable\", \"x\": 42}')
+_TEST_JSONVALUE_OBJ_DECODED = TfxTestJsonableCls(42)
 
 
 class StandardArtifactsTest(tf.test.TestCase):
@@ -71,6 +104,27 @@ class StandardArtifactsTest(tf.test.TestCase):
     self.assertEqual(_TEST_FLOAT_RAW, instance.encode(_TEST_FLOAT_DECODED))
     self.assertAlmostEqual(_TEST_FLOAT_DECODED,
                            instance.decode(_TEST_FLOAT_RAW))
+
+  def testJsonValueList(self):
+    instance = standard_artifacts.JsonValue()
+    self.assertEqual(_TEST_JSONVALUE_LIST_RAW,
+                     instance.encode(_TEST_JSONVALUE_LIST_DECODED))
+    self.assertEqual(_TEST_JSONVALUE_LIST_DECODED,
+                     instance.decode(_TEST_JSONVALUE_LIST_RAW))
+
+  def testJsonValueDict(self):
+    instance = standard_artifacts.JsonValue()
+    self.assertEqual(_TEST_JSONVALUE_DICT_RAW,
+                     instance.encode(_TEST_JSONVALUE_DICT_DECODED))
+    self.assertEqual(_TEST_JSONVALUE_DICT_DECODED,
+                     instance.decode(_TEST_JSONVALUE_DICT_RAW))
+
+  def testJsonValueObj(self):
+    instance = standard_artifacts.JsonValue()
+    self.assertEqual(_TEST_JSONVALUE_OBJ_RAW,
+                     instance.encode(_TEST_JSONVALUE_OBJ_DECODED))
+    self.assertEqual(_TEST_JSONVALUE_OBJ_DECODED,
+                     instance.decode(_TEST_JSONVALUE_OBJ_RAW))
 
   @mock.patch('absl.logging.warning')
   def testFloatTypePrecisionLossWarning(self, *unused_mocks):
@@ -113,6 +167,39 @@ class StandardArtifactsTest(tf.test.TestCase):
     self.assertTrue(math.isinf(decoded_negative_infinity))
     self.assertTrue(math.isnan(decoded_nan))
 
+  def testExamples(self):
+    with self.subTest('Initial state'):
+      examples = standard_artifacts.Examples()
+      self.assertEqual(examples.split_names, '')
+      self.assertEmpty(examples.splits)
 
-if __name__ == '__main__':
-  tf.test.main()
+    with self.subTest('Empty splits'):
+      examples = standard_artifacts.Examples()
+      examples.splits = []
+      self.assertEqual(examples.split_names, '[]')
+      self.assertEmpty(examples.splits)
+
+    with self.subTest('Single split'):
+      examples = standard_artifacts.Examples()
+      examples.splits = ['train']
+      self.assertEqual(examples.split_names, '["train"]')
+
+    with self.subTest('Multiple splits'):
+      examples = standard_artifacts.Examples()
+      examples.splits = ['train', 'validation', 'test']
+      self.assertEqual(examples.split_names, '["train", "validation", "test"]')
+
+    with self.subTest('Invalid splits'):
+      examples = standard_artifacts.Examples()
+      with self.assertRaises(ValueError):
+        examples.splits = ['train', '_validation']  # Should not start with _.
+      with self.assertRaises(TypeError):
+        examples.splits = '["train", "validation"]'  # Should be Sequence[str]
+
+    with self.subTest('Split path'):
+      examples = standard_artifacts.Examples()
+      examples.uri = '/test'
+      examples.splits = ['train']
+      self.assertEqual(examples.path(split='train'), '/test/Split-train')
+      with self.assertRaises(ValueError):
+        examples.path(split='non-existing')

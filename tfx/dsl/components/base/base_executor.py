@@ -14,24 +14,14 @@
 """Abstract TFX executor class."""
 
 import abc
-import json
 import os
 from typing import Any, Dict, List, Optional
 
 from absl import logging
 from tfx import types
 from tfx.dsl.io import fileio
-from tfx.orchestration import data_types_utils
 from tfx.proto.orchestration import execution_result_pb2
 from tfx.proto.orchestration import pipeline_pb2
-from tfx.types import artifact_utils
-
-try:
-  import apache_beam as beam  # pylint: disable=g-import-not-at-top
-  _BeamPipeline = beam.Pipeline
-except ModuleNotFoundError:
-  beam = None
-  _BeamPipeline = Any
 
 
 class BaseExecutor(abc.ABC):
@@ -72,23 +62,23 @@ class BaseExecutor(abc.ABC):
       return os.path.join(self._tmp_dir, str(self._unique_id), '')
 
     @property
-    def executor_output_uri(self) -> str:
+    def executor_output_uri(self) -> Optional[str]:
       return self._executor_output_uri
 
     @property
-    def stateful_working_dir(self) -> str:
+    def stateful_working_dir(self) -> Optional[str]:
       return self._stateful_working_dir
 
     @property
-    def pipeline_node(self) -> pipeline_pb2.PipelineNode:
+    def pipeline_node(self) -> Optional[pipeline_pb2.PipelineNode]:
       return self._pipeline_node
 
     @property
-    def pipeline_info(self) -> pipeline_pb2.PipelineInfo:
+    def pipeline_info(self) -> Optional[pipeline_pb2.PipelineInfo]:
       return self._pipeline_info
 
     @property
-    def pipeline_run_id(self) -> str:
+    def pipeline_run_id(self) -> Optional[str]:
       return self._pipeline_run_id
 
   @abc.abstractmethod
@@ -134,17 +124,11 @@ class BaseExecutor(abc.ABC):
   def _log_startup(self, inputs: Dict[str, List[types.Artifact]],
                    outputs: Dict[str, List[types.Artifact]],
                    exec_properties: Dict[str, Any]) -> None:
-    """Log inputs, outputs, and executor properties in a standard format."""
+    """Logs a message indicating the start of an execution."""
+    del inputs, outputs, exec_properties
+    # No need to log inputs, outputs and exec_properties. These are all written
+    # to the base directory in the ExecutionInvocation proto.
     logging.debug('Starting %s execution.', self.__class__.__name__)
-    logging.debug('Inputs for %s are: %s', self.__class__.__name__,
-                  artifact_utils.jsonify_artifact_dict(inputs))
-    logging.debug('Outputs for %s are: %s', self.__class__.__name__,
-                  artifact_utils.jsonify_artifact_dict(outputs))
-    logging.debug(
-        'Execution properties for %s are: %s', self.__class__.__name__,
-        json.dumps(
-            data_types_utils.build_value_dict(
-                data_types_utils.build_metadata_value_dict(exec_properties))))
 
 
 class EmptyExecutor(BaseExecutor):

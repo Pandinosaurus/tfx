@@ -13,14 +13,14 @@
 # limitations under the License.
 """Tests for tfx.orchestration.portable.partial_run_utils."""
 
-import collections
+
+from collections.abc import Sequence
 from typing import Dict, List, Mapping, Optional, Set, Tuple, Union
 from unittest import mock
 
 from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
-
 from tfx.dsl.compiler import compiler
 from tfx.dsl.compiler import compiler_utils
 from tfx.dsl.compiler import constants
@@ -45,6 +45,7 @@ from ml_metadata.proto import metadata_store_pb2
 _PIPELINE_RUN_CONTEXT_KEY = constants.PIPELINE_RUN_CONTEXT_TYPE_NAME
 
 
+# pylint: disable=invalid-name
 def _to_context_spec(type_name: str, name: str) -> pipeline_pb2.ContextSpec:
   return pipeline_pb2.ContextSpec(
       type=metadata_store_pb2.ContextType(name=type_name),
@@ -78,6 +79,11 @@ def _to_input_channel(
           type=metadata_store_pb2.ArtifactType(name=artifact_type)))
 
 
+@component
+def TfxTestComponent():
+  pass
+
+
 class MarkPipelineFnTest(parameterized.TestCase, test_case_utils.TfxTest):
 
   def _checkNodeExecutionOptions(
@@ -88,100 +94,132 @@ class MarkPipelineFnTest(parameterized.TestCase, test_case_utils.TfxTest):
       nodes_requiring_snapshot: Set[str],
       nodes_to_skip: Set[str],
       nodes_required_to_reuse: Set[str],
-      nodes_optional_to_reuse: Optional[Set[str]] = None):
-    for node in pipeline.nodes:
-      try:
-        node_id = node.pipeline_node.node_info.id
-        run_or_skip = node.pipeline_node.execution_options.WhichOneof(
-            'partial_run_option')
-        self.assertIsNotNone(run_or_skip)
-        # assert partial_run_option == 'run' iff node_id in nodes_to_run
-        if node_id in nodes_to_run:
-          if node_id in nodes_to_skip:
-            raise ValueError(f'node_id {node_id} appears in both nodes_to_run '
-                             'and nodes_to_skip.')
-          self.assertEqual(run_or_skip, 'run')
-          # assert snapshot_settings is set iff node_id == snapshot_node
-          if node_id == snapshot_node:
-            self.assertTrue(
-                node.pipeline_node.execution_options.run.perform_snapshot)
+      nodes_optional_to_reuse: Optional[Set[str]] = None,
+  ):
+    for pipeline_or_node in pipeline.nodes:
+      node_type = pipeline_or_node.WhichOneof('node')
+      if node_type == 'pipeline_node':
+        node = pipeline_or_node
+      elif node_type == 'sub_pipeline':
+        # Create a "node view" for subpipelines.
+        node = pipeline_pb2.Pipeline.PipelineOrNode()
+        node.pipeline_node.node_info.id = (
+            pipeline_or_node.sub_pipeline.pipeline_info.id
+        )
+        node.pipeline_node.execution_options.CopyFrom(
+            pipeline_or_node.sub_pipeline.nodes[
+                0
+            ].pipeline_node.execution_options
+        )
+      else:
+        raise ValueError(
+            'pipeline_or_node must be PipelineNode or Pipeline, but got'
+            f' {node_type} instead.'
+        )
+      with self.subTest(f'For node {node.pipeline_node.node_info.id}'):
+        try:
+          node_id = node.pipeline_node.node_info.id
+          run_or_skip = node.pipeline_node.execution_options.WhichOneof(
+              'partial_run_option'
+          )
+          self.assertIsNotNone(run_or_skip)
+          # assert partial_run_option == 'run' iff node_id in nodes_to_run
+          if node_id in nodes_to_run:
+            if node_id in nodes_to_skip:
+              raise ValueError(
+                  f'node_id {node_id} appears in both nodes_to_run '
+                  'and nodes_to_skip.'
+              )
+            self.assertEqual(run_or_skip, 'run')
+            # assert snapshot_settings is set iff node_id == snapshot_node
+            if node_id == snapshot_node:
+              self.assertTrue(
+                  node.pipeline_node.execution_options.run.perform_snapshot
+              )
+            else:
+              self.assertFalse(
+                  node.pipeline_node.execution_options.run.perform_snapshot
+              )
+            # assert depends_on_snapshot == node_id in nodes_requiring_snapshot
+            if node.pipeline_node.execution_options.run.depends_on_snapshot:
+              self.assertIn(node_id, nodes_requiring_snapshot)
+            else:
+              self.assertNotIn(node_id, nodes_requiring_snapshot)
+          elif node_id in nodes_to_skip:
+            self.assertEqual(run_or_skip, 'skip')
+            # assert reuse_artifacts iff node_id in nodes_required_to_reuse
+            if node_id in nodes_required_to_reuse:
+              self.assertEqual(
+                  node.pipeline_node.execution_options.skip.reuse_artifacts_mode,
+                  pipeline_pb2.NodeExecutionOptions.Skip.REQUIRED,
+              )
+            elif nodes_optional_to_reuse and node_id in nodes_optional_to_reuse:
+              self.assertEqual(
+                  node.pipeline_node.execution_options.skip.reuse_artifacts_mode,
+                  pipeline_pb2.NodeExecutionOptions.Skip.OPTIONAL,
+              )
+            else:
+              self.assertEqual(
+                  node.pipeline_node.execution_options.skip.reuse_artifacts_mode,
+                  pipeline_pb2.NodeExecutionOptions.Skip.NEVER,
+              )
           else:
-            self.assertFalse(
-                node.pipeline_node.execution_options.run.perform_snapshot)
-          # assert depends_on_snapshot == (node_id in nodes_requiring_snapshot)
-          if node.pipeline_node.execution_options.run.depends_on_snapshot:
-            self.assertIn(node_id, nodes_requiring_snapshot)
-          else:
-            self.assertNotIn(node_id, nodes_requiring_snapshot)
-        elif node_id in nodes_to_skip:
-          self.assertEqual(run_or_skip, 'skip')
-          # assert reuse_artifacts iff node_id in nodes_required_to_reuse
-          if node_id in nodes_required_to_reuse:
-            self.assertEqual(
-                node.pipeline_node.execution_options.skip.reuse_artifacts_mode,
-                pipeline_pb2.NodeExecutionOptions.Skip.REQUIRED)
-          elif nodes_optional_to_reuse and node_id in nodes_optional_to_reuse:
-            self.assertEqual(
-                node.pipeline_node.execution_options.skip.reuse_artifacts_mode,
-                pipeline_pb2.NodeExecutionOptions.Skip.OPTIONAL)
-          else:
-            self.assertEqual(
-                node.pipeline_node.execution_options.skip.reuse_artifacts_mode,
-                pipeline_pb2.NodeExecutionOptions.Skip.NEVER)
-        else:
-          raise ValueError(f'node_id {node_id} appears in neither nodes_to_run '
-                           'nor nodes_to_skip.')
-      except AssertionError:
-        logging.exception('_checkNodeExecutionOptions failed in node: %s',
-                          node.pipeline_node)
-        raise
+            raise ValueError(
+                f'node_id {node_id} appears in neither nodes_to_run '
+                'nor nodes_to_skip.'
+            )
+        except AssertionError:
+          logging.exception(
+              '_checkNodeExecutionOptions failed in node: %s',
+              node.pipeline_node,
+          )
+          raise
 
-  def _createInputPipeline(self, node_to_downstream_nodes: Dict[str,
-                                                                List[str]]):
-    pipeline_name = 'test_pipeline'
-    input_pipeline = pipeline_pb2.Pipeline()
-    input_pipeline.pipeline_info.id = pipeline_name
-    input_pipeline.execution_mode = pipeline_pb2.Pipeline.SYNC
+  def _createInputPipeline(
+      self,
+      node_to_downstream_nodes: Dict[str, List[str]],
+      subpipelines: Sequence[str] = (),
+  ):
 
-    node_to_upstream_nodes = collections.defaultdict(list)
+    if not all(
+        subpipeline in node_to_downstream_nodes for subpipeline in subpipelines
+    ):
+      raise ValueError(
+          'All provided subpipelines must also be in node_to_downstream_nodes.'
+          f' Subpipelines: {subpipelines}, node_to_downstream_nodes:'
+          f' {node_to_downstream_nodes}'
+      )
+
+    # Only need to setup sufficiently to mark pipeline, since BeamDagRunner does
+    # not support running subpipelines.
+    subpipeline_by_name = {}
+    for s_p in subpipelines:
+      n = TfxTestComponent().with_id('node')
+      p = pipeline_lib.Pipeline(
+          pipeline_name=s_p,
+          components=[n],
+      )
+      subpipeline_by_name[s_p] = p
+
+    components = {}
+    for node in node_to_downstream_nodes:
+      if node not in subpipeline_by_name:
+        c = TfxTestComponent().with_id(node)
+      else:
+        c = subpipeline_by_name[node]
+      components[node] = c
+
     for node, downstream_nodes in node_to_downstream_nodes.items():
-      for downstream_node in downstream_nodes:
-        node_to_upstream_nodes[downstream_node].append(node)
+      components[node].add_downstream_nodes(
+          [components[n] for n in downstream_nodes]
+      )
 
-    for node, downstream_nodes in node_to_downstream_nodes.items():
-      # Use upper case of node name as its type.
-      node_type = node.upper()
-      n = input_pipeline.nodes.add()
-      n.pipeline_node.node_info.id = node
-      n.pipeline_node.node_info.type.name = node_type
-      n.pipeline_node.contexts.contexts.extend([
-          _to_context_spec('pipeline', pipeline_name),
-          _to_context_spec('component', node),
-      ])
+    input_pipeline = pipeline_lib.Pipeline(
+        pipeline_name='test_pipeline',
+        components=list(components.values()),
+    )
 
-      if node in node_to_upstream_nodes:
-        for upstream_node in node_to_upstream_nodes[node]:
-          upstream_node_type = upstream_node.upper()
-          n.pipeline_node.inputs.inputs['in'].channels.extend([
-              _to_input_channel(
-                  producer_node_id=upstream_node,
-                  producer_output_key='out',
-                  artifact_type=upstream_node_type + node_type,
-                  context_names={
-                      'pipeline': pipeline_name,
-                      'component': node,
-                  }),
-          ])
-          n.pipeline_node.inputs.inputs['in'].min_count = 1
-          n.pipeline_node.upstream_nodes.extend([upstream_node])
-
-      for downstream_node in downstream_nodes:
-        downstream_node_type = downstream_node.upper()
-        n.pipeline_node.outputs.outputs['out'].CopyFrom(
-            _to_output_spec(node_type + downstream_node_type))
-        n.pipeline_node.downstream_nodes.extend([downstream_node])
-
-    return input_pipeline
+    return compiler.Compiler().compile(input_pipeline)
 
   def testAsyncPipeline_error(self):
     """If Pipeline has execution_mode ASYNC, raise ValueError."""
@@ -196,21 +234,6 @@ class MarkPipelineFnTest(parameterized.TestCase, test_case_utils.TfxTest):
         ValueError,
         'Pipeline filtering is only supported for SYNC execution modes; '
         'found pipeline with execution mode: ASYNC'):
-      partial_run_utils.mark_pipeline(input_pipeline, from_nodes=['a'])
-
-  def testSubpipeline_error(self):
-    """If Pipeline contains sub-pipeline, raise ValueError."""
-    input_pipeline = pipeline_pb2.Pipeline()
-    input_pipeline.pipeline_info.id = 'my_pipeline'
-    input_pipeline.execution_mode = pipeline_pb2.Pipeline.SYNC
-    sub_pipeline_node = input_pipeline.nodes.add()
-    sub_pipeline_node.sub_pipeline.pipeline_info.id = 'my_subpipeline'
-    node_a = sub_pipeline_node.sub_pipeline.nodes.add()
-    node_a.pipeline_node.node_info.id = 'a'
-
-    with self.assertRaisesRegex(
-        ValueError,
-        'Pipeline filtering not supported for pipelines with sub-pipelines.'):
       partial_run_utils.mark_pipeline(input_pipeline, from_nodes=['a'])
 
   def testAlreadyMarked_error(self):
@@ -237,7 +260,7 @@ class MarkPipelineFnTest(parameterized.TestCase, test_case_utils.TfxTest):
     with self.assertRaisesRegex(
         ValueError,
         r"Nodes \['x', 'y'\] specified in from_nodes/to_nodes are not present "
-        'in the pipeline.'):
+        r"in the pipeline. Valid nodes are {'a'}"):
       partial_run_utils.mark_pipeline(input_pipeline,
                                       from_nodes=['x'],
                                       to_nodes=['y'])
@@ -556,6 +579,68 @@ class MarkPipelineFnTest(parameterized.TestCase, test_case_utils.TfxTest):
         nodes_to_skip=set(['a', 'b']),
         nodes_required_to_reuse=set(['a', 'b']))
 
+  def testSkipSnapshotNodes(self):
+    """Node in skip_snapshot_nodes will be optionally reused."""
+    input_pipeline = self._createInputPipeline({
+        'a': ['b'],
+        'b': ['c'],
+        'c': ['d'],
+        'd': []
+    })
+    partial_run_utils.mark_pipeline(
+        input_pipeline,
+        from_nodes=['c'],
+        to_nodes=['d'],
+        skip_snapshot_nodes=['b'])
+    self._checkNodeExecutionOptions(
+        input_pipeline,
+        snapshot_node='c',
+        nodes_to_run=set(['c', 'd']),
+        nodes_requiring_snapshot=set(['c']),
+        nodes_to_skip=set(['a', 'b']),
+        nodes_required_to_reuse=set(['a']),
+        nodes_optional_to_reuse=set(['b']))
+
+    input_pipeline = self._createInputPipeline({
+        'a': ['b'],
+        'b': ['c'],
+        'c': ['d'],
+        'd': []
+    })
+    partial_run_utils.mark_pipeline(
+        input_pipeline,
+        from_nodes=['b'],
+        to_nodes=['d'],
+        skip_snapshot_nodes=['a', 'b'])
+    self._checkNodeExecutionOptions(
+        input_pipeline,
+        snapshot_node='b',
+        nodes_to_run=set(['b', 'c', 'd']),
+        nodes_requiring_snapshot=set(['b']),
+        nodes_to_skip=set(['a']),
+        nodes_required_to_reuse=set([]),
+        nodes_optional_to_reuse=set(['a']))
+
+  @parameterized.named_parameters(
+      ('at_start', 'a'),
+      ('in_middle', 'b'),
+      ('at_end', 'c'),
+  )
+  def testComposeablePipeline(self, subpipeline):
+    input_pipeline = self._createInputPipeline(
+        {'a': ['b'], 'b': ['c'], 'c': []}, subpipelines=[subpipeline]
+    )
+
+    partial_run_utils.mark_pipeline(input_pipeline, from_nodes=['b'])
+    self._checkNodeExecutionOptions(
+        input_pipeline,
+        snapshot_node='b',
+        nodes_to_run=set(['b', 'c', 'd']),
+        nodes_requiring_snapshot=set(['b']),
+        nodes_to_skip=set(['a']),
+        nodes_required_to_reuse=set(['a']),
+    )
+
 
 # pylint: disable=invalid-name
 @component
@@ -598,9 +683,6 @@ def Result(result: InputArtifact[standard_artifacts.Integer]):
 
 
 # pytype: enable=wrong-arg-types
-# pylint: enable=invalid-name
-
-
 def _node_inputs_by_id(pipeline: pipeline_pb2.Pipeline,
                        node_id: str) -> pipeline_pb2.PipelineNode:
   """Doesn't make a copy."""
@@ -615,6 +697,9 @@ def _node_inputs_by_id(pipeline: pipeline_pb2.Pipeline,
       f'node_id {node_id} not found in pipeline. Seen: {node_ids_seen}')
 
 
+# Disable all no-value-for-parameter error which produces false positive when
+# invoking functional TFX components.
+# pylint: disable=no-value-for-parameter
 class PartialRunTest(absltest.TestCase):
 
   def setUp(self):
@@ -626,21 +711,29 @@ class PartialRunTest(absltest.TestCase):
         pipeline_root_dir.create_file('mlmd.sqlite').full_path)
     self.result_node_id = Result.__name__
 
-  def make_pipeline(self,
-                    components,
-                    run_id: Optional[str] = None) -> pipeline_pb2.Pipeline:
+  def make_pipeline(  # pylint: disable=invalid-name
+      self,
+      components,
+      run_id: Optional[str] = None,
+      pipeline_name: Optional[str] = None,
+  ) -> pipeline_pb2.Pipeline:
     """Make compiled pipeline from components.
 
     Args:
       components: List of components.
-      run_id: Optional.If provided, will be used to substitute the
+      run_id: Optional. If provided, will be used to substitute the
         pipeline_run_id RuntimeParameter.
+      pipeline_name: Optional. If provided, will use it as pipeline name.
 
     Returns:
       The compiled Pipeline IR.
     """
-    pipeline = pipeline_lib.Pipeline(self.pipeline_name, self.pipeline_root,
-                                     self.metadata_config, components)
+    pipeline = pipeline_lib.Pipeline(
+        pipeline_name=pipeline_name if pipeline_name else self.pipeline_name,
+        pipeline_root=self.pipeline_root,
+        metadata_connection_config=self.metadata_config,
+        components=components,
+    )
     result = compiler.Compiler().compile(pipeline)
     if run_id:
       runtime_parameter_utils.substitute_runtime_parameter(
@@ -658,12 +751,57 @@ class PartialRunTest(absltest.TestCase):
     with metadata.Metadata(self.metadata_config) as m:
       for node_id, exp_result in node_id_exp_result_tups:
         result_node_inputs = _node_inputs_by_id(pipeline_pb, node_id=node_id)
-        input_resolution_result = inputs_utils.resolve_input_artifacts_v2(
-            metadata_handler=m, pipeline_node=result_node_inputs)
+        input_resolution_result = inputs_utils.resolve_input_artifacts(
+            metadata_handle=m, pipeline_node=result_node_inputs
+        )
         self.assertIsInstance(input_resolution_result, inputs_utils.Trigger)
         result_artifact = input_resolution_result[0]['result'][0]
         result_artifact.read()
         self.assertEqual(result_artifact.value, exp_result)
+
+  def testArtifactRecyler_MultiplePipelines(self):
+    """Tests that ArtifactRecyler works with multiple pipelines."""
+    load = Load(start_num=1)
+    add_num = AddNum(to_add=1, num=load.outputs['num'])
+    result = Result(result=add_num.outputs['added_num'])
+
+    # Creates the first pipeline and runs it twice.
+    pipeline_pb_run_1 = self.make_pipeline(
+        components=[load, add_num, result], run_id='test_pipeline_run_1')
+    beam_dag_runner.BeamDagRunner().run_with_ir(pipeline_pb_run_1)
+    pipeline_pb_run_2 = self.make_pipeline(
+        components=[load, add_num, result], run_id='test_pipeline_run_2')
+    beam_dag_runner.BeamDagRunner().run_with_ir(pipeline_pb_run_2)
+
+    # Creates the second pipeline and runs it once.
+    second_pipeline_pb_run_1 = self.make_pipeline(
+        components=[load, add_num, result],
+        run_id='second_pipeline_run_1',
+        pipeline_name='second_pipeline')
+    beam_dag_runner.BeamDagRunner().run_with_ir(second_pipeline_pb_run_1)
+
+    with metadata.Metadata(self.metadata_config) as m:
+      artifact_recyler = partial_run_utils._ArtifactRecycler(
+          m,
+          pipeline_name='test_pipeline',
+          new_run_id='new_run_id',
+          new_pipeline_run_ir=pipeline_pb_run_2,
+      )
+      self.assertEqual(
+          'test_pipeline_run_2',
+          artifact_recyler._get_base_pipeline_run_context().name,
+      )
+
+      artifact_recyler = partial_run_utils._ArtifactRecycler(
+          m,
+          pipeline_name='second_pipeline',
+          new_run_id='new_run_id',
+          new_pipeline_run_ir=second_pipeline_pb_run_1,
+      )
+      self.assertEqual(
+          'second_pipeline_run_1',
+          artifact_recyler._get_base_pipeline_run_context().name,
+      )
 
   def testSnapshot_removeFirstNode(self):
     """Tests that partial run with the first node removed works."""
@@ -681,8 +819,8 @@ class PartialRunTest(absltest.TestCase):
     #          -------        ---------        ---------
     #
     ############################################################################
-    load = Load(start_num=1)  # pylint: disable=no-value-for-parameter
-    add_num = AddNum(to_add=1, num=load.outputs['num'])  # pylint: disable=no-value-for-parameter
+    load = Load(start_num=1)
+    add_num = AddNum(to_add=1, num=load.outputs['num'])
     result = Result(result=add_num.outputs['added_num'])
     pipeline_pb_run_1 = self.make_pipeline(
         components=[load, add_num, result], run_id='run_1')
@@ -723,8 +861,8 @@ class PartialRunTest(absltest.TestCase):
     #          -------        ---------        ---------
     #
     ############################################################################
-    add_num_v2 = AddNum(to_add=5, num=load.outputs['num'])  # pylint: disable=no-value-for-parameter
-    load.remove_downstream_node(add_num)  # This line is important.
+    load = Load(start_num=1)
+    add_num_v2 = AddNum(to_add=5, num=load.outputs['num'])
     result_v2 = Result(result=add_num_v2.outputs['added_num'])
     pipeline_pb_run_2 = self.make_pipeline(
         components=[load, add_num_v2, result_v2], run_id='run_2')
@@ -789,7 +927,6 @@ class PartialRunTest(absltest.TestCase):
     #            (10)              (10)
     #
     ############################################################################
-    # pylint: disable=no-value-for-parameter
     load_1 = Load(start_num=1).with_id('load_1')
     add_num_1 = AddNum(to_add=1, num=load_1.outputs['num']).with_id('add_num_1')
     result_1 = Result(result=add_num_1.outputs['added_num']).with_id('result_1')
@@ -797,7 +934,6 @@ class PartialRunTest(absltest.TestCase):
     add_num_2 = AddNum(
         to_add=10, num=load_2.outputs['num']).with_id('add_num_2')
     result_2 = Result(result=add_num_2.outputs['added_num']).with_id('result_2')
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_1 = self.make_pipeline(
         components=[load_1, add_num_1, result_1, load_2, add_num_2, result_2],
         run_id='run_1')
@@ -831,13 +967,15 @@ class PartialRunTest(absltest.TestCase):
     #          ---------        -----------        -----------
     #
     ############################################################################
-    # pylint: disable=no-value-for-parameter
+    load_1 = Load(start_num=1).with_id('load_1')
     add_num_1_v2 = AddNum(
         to_add=5, num=load_1.outputs['num']).with_id('add_num_1')
-    load_1.remove_downstream_node(add_num_1)  # This line is important.
     result_1_v2 = Result(
         result=add_num_1_v2.outputs['added_num']).with_id('result_1')
-    # pylint: enable=no-value-for-parameter
+    load_2 = Load(start_num=10).with_id('load_2')
+    add_num_2 = AddNum(
+        to_add=10, num=load_2.outputs['num']).with_id('add_num_2')
+    result_2 = Result(result=add_num_2.outputs['added_num']).with_id('result_2')
     pipeline_pb_run_2 = self.make_pipeline(
         components=[
             load_1,
@@ -889,13 +1027,16 @@ class PartialRunTest(absltest.TestCase):
     #          ---------        -----------        -----------
     #
     ############################################################################
-    # pylint: disable=no-value-for-parameter
+    load_1 = Load(start_num=1).with_id('load_1')
+    add_num_1_v2 = AddNum(
+        to_add=5, num=load_1.outputs['num']).with_id('add_num_1')
+    result_1_v2 = Result(
+        result=add_num_1_v2.outputs['added_num']).with_id('result_1')
+    load_2 = Load(start_num=10).with_id('load_2')
     add_num_2_v2 = AddNum(
         to_add=50, num=load_2.outputs['num']).with_id('add_num_2')
-    load_2.remove_downstream_node(add_num_2)  # This line is important.
     result_2_v2 = Result(
         result=add_num_2_v2.outputs['added_num']).with_id('result_2')
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_3 = self.make_pipeline(
         components=[
             load_1,
@@ -1000,18 +1141,26 @@ class PartialRunTest(absltest.TestCase):
           run_context.name: run_context for run_context in
           m.store.get_contexts_by_type(constants.PIPELINE_RUN_CONTEXT_TYPE_NAME)
       }
-      self.assertEqual(
+      [pipeline_context
+      ] = m.store.get_contexts_by_type(constants.PIPELINE_CONTEXT_TYPE_NAME)
+      self.assertCountEqual(
           m.store.get_parent_contexts_by_context(
               pipeline_run_contexts['run_4'].id),
-          [pipeline_run_contexts['run_3']])
-      self.assertEqual(
+          [pipeline_context, pipeline_run_contexts['run_3']])
+      self.assertCountEqual(
           m.store.get_parent_contexts_by_context(
               pipeline_run_contexts['run_3'].id),
-          [pipeline_run_contexts['run_2']])
-      self.assertEqual(
+          [pipeline_context, pipeline_run_contexts['run_2']])
+      self.assertCountEqual(
           m.store.get_parent_contexts_by_context(
               pipeline_run_contexts['run_2'].id),
-          [pipeline_run_contexts['run_1']])
+          [pipeline_context, pipeline_run_contexts['run_1']])
+
+      self.assertCountEqual(
+          m.store.get_children_contexts_by_context(pipeline_context.id), [
+              pipeline_run_contexts['run_1'], pipeline_run_contexts['run_2'],
+              pipeline_run_contexts['run_3'], pipeline_run_contexts['run_4']
+          ])
 
   def testReusePipelineArtifacts_preventInconsistency(self):
     """Tests that a tricky sequence of partial runs raises an error."""
@@ -1031,13 +1180,11 @@ class PartialRunTest(absltest.TestCase):
     #                     \______________________/
     #
     ############################################################################
-    # pylint: disable=no-value-for-parameter
     load = Load(start_num=1)
     add_num = AddNum(to_add=1, num=load.outputs['num'])
     subtract_nums = SubtractNums(
         num_1=add_num.outputs['added_num'], num_2=load.outputs['num'])
     result = Result(result=subtract_nums.outputs['diff'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_1 = self.make_pipeline(
         components=[load, add_num, subtract_nums, result], run_id='run_1')
     ############################################################################
@@ -1067,14 +1214,11 @@ class PartialRunTest(absltest.TestCase):
     #                     \______________________/
     #
     ############################################################################
-    # pylint: disable=no-value-for-parameter
+    load = Load(start_num=1)
     add_num_v2 = AddNum(to_add=5, num=load.outputs['num'])
-    load.remove_downstream_node(add_num)  # This line is important.
     subtract_nums_v2 = SubtractNums(
         num_1=add_num_v2.outputs['added_num'], num_2=load.outputs['num'])
-    load.remove_downstream_node(subtract_nums)  # This line is important.
     result_v2 = Result(result=subtract_nums_v2.outputs['diff'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_2 = self.make_pipeline(
         components=[load, add_num_v2, subtract_nums_v2, result_v2],
         run_id='run_2')
@@ -1125,13 +1269,11 @@ class PartialRunTest(absltest.TestCase):
     #                     \______________________/
     #
     ############################################################################
-    # pylint: disable=no-value-for-parameter
     load_v2 = Load(start_num=5)
     add_num_v3 = AddNum(to_add=5, num=load_v2.outputs['num'])
     subtract_nums_v3 = SubtractNums(
         num_1=add_num_v3.outputs['added_num'], num_2=load_v2.outputs['num'])
     result_v3 = Result(result=subtract_nums_v3.outputs['diff'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_3 = self.make_pipeline(
         components=[load_v2, add_num_v3, subtract_nums_v3, result_v3],
         run_id='run_3')
@@ -1217,17 +1359,17 @@ class PartialRunTest(absltest.TestCase):
 
   def testNonExistentBaseRunId_lookupError(self):
     """Raise error if user provides non-existent base_run_id."""
-    # pylint: disable=no-value-for-parameter
     load = Load(start_num=1)
     add_num = AddNum(to_add=1, num=load.outputs['num'])
     result = Result(result=add_num.outputs['added_num'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_1 = self.make_pipeline(
-        components=[load, add_num, result], run_id='run_1')
+        components=[load, add_num, result],
+        run_id='run_1')
     beam_dag_runner.BeamDagRunner().run_with_ir(pipeline_pb_run_1)
 
     pipeline_pb_run_2 = self.make_pipeline(
-        components=[load, add_num, result], run_id='run_2')
+        components=[load, add_num, result],
+        run_id='run_2')
     snapshot_settings = pipeline_pb2.SnapshotSettings()
     snapshot_settings.base_pipeline_run_strategy.base_run_id = 'non_existent_id'
     partial_run_utils.mark_pipeline(
@@ -1240,20 +1382,16 @@ class PartialRunTest(absltest.TestCase):
 
   def testNonExistentNodeId_lookupError(self):
     """Raise error if user provides non-existent pipeline_run_id or node_id."""
-    # pylint: disable=no-value-for-parameter
     load = Load(start_num=1)
     add_num = AddNum(to_add=1, num=load.outputs['num'])
     result = Result(result=add_num.outputs['added_num'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_1 = self.make_pipeline(
         components=[load, add_num, result], run_id='run_1')
     beam_dag_runner.BeamDagRunner().run_with_ir(pipeline_pb_run_1)
 
-    # pylint: disable=no-value-for-parameter
     load_v2 = Load(start_num=2).with_id('non_existent_id')
     add_num_v2 = AddNum(to_add=1, num=load_v2.outputs['num'])
     result_v2 = Result(result=add_num_v2.outputs['added_num'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_2 = self.make_pipeline(
         components=[load_v2, add_num_v2, result_v2], run_id='run_2')
     snapshot_settings = pipeline_pb2.SnapshotSettings()
@@ -1263,16 +1401,14 @@ class PartialRunTest(absltest.TestCase):
         from_nodes=[add_num_v2.id],
         snapshot_settings=snapshot_settings)
     with self.assertRaisesRegex(LookupError,
-                                'node context .* not found in MLMD.'):
+                                'pipeline_run_id .* not found in MLMD.'):
       beam_dag_runner.BeamDagRunner().run_with_ir(pipeline_pb_run_2)
 
   def testNoPreviousSuccessfulExecution_lookupError(self):
     """Raise error if user tries to reuse node w/o any successful Executions."""
-    # pylint: disable=no-value-for-parameter
     load_fail = LoadFail(start_num=1)
     add_num = AddNum(to_add=1, num=load_fail.outputs['num'])
     result = Result(result=add_num.outputs['added_num'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_1 = self.make_pipeline(
         components=[load_fail, add_num, result], run_id='run_1')
     try:
@@ -1281,11 +1417,9 @@ class PartialRunTest(absltest.TestCase):
     except Exception:  # pylint: disable=broad-except
       pass
 
-    # pylint: disable=no-value-for-parameter
+    load_fail = LoadFail(start_num=1)
     add_num_v2 = AddNum(to_add=1, num=load_fail.outputs['num'])
-    load_fail.remove_downstream_node(add_num)  # this line is important
     result_v2 = Result(result=add_num_v2.outputs['added_num'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_2 = self.make_pipeline(
         components=[load_fail, add_num_v2, result_v2], run_id='run_2')
     partial_run_utils.mark_pipeline(
@@ -1310,16 +1444,16 @@ class PartialRunTest(absltest.TestCase):
     Thus, we need to make sure that even if `reuse_node_outputs` was retried
     after registration succeeds, there will only be one cache execution.
     """
-    load = Load(start_num=1)  # pylint: disable=no-value-for-parameter
-    add_num = AddNum(to_add=1, num=load.outputs['num'])  # pylint: disable=no-value-for-parameter
+    load = Load(start_num=1)
+    add_num = AddNum(to_add=1, num=load.outputs['num'])
     result = Result(result=add_num.outputs['added_num'])
     pipeline_pb_run_1 = self.make_pipeline(
         components=[load, add_num, result], run_id='run_1')
     beam_dag_runner.BeamDagRunner().run_with_ir(pipeline_pb_run_1)
     self.assertResultEqual(pipeline_pb_run_1, 2)
 
-    add_num_v2 = AddNum(to_add=5, num=load.outputs['num'])  # pylint: disable=no-value-for-parameter
-    load.remove_downstream_node(add_num)  # This line is important.
+    load = Load(start_num=1)
+    add_num_v2 = AddNum(to_add=5, num=load.outputs['num'])
     result_v2 = Result(result=add_num_v2.outputs['added_num'])
     pipeline_pb_run_2 = self.make_pipeline(
         components=[load, add_num_v2, result_v2], run_id='run_2')
@@ -1330,9 +1464,9 @@ class PartialRunTest(absltest.TestCase):
     # Simulate success in registering cache execution, but failure when
     # publishing -- e.g., job was pre-empted.
     with mock.patch.object(
-        execution_publish_utils, 'publish_cached_execution',
-        autospec=True) as mock_publish_cached_execution:
-      mock_publish_cached_execution.side_effect = ConnectionResetError()
+        execution_publish_utils, 'publish_cached_executions', autospec=True
+    ) as mock_publish_cached_executions:
+      mock_publish_cached_executions.side_effect = ConnectionResetError()
       try:
         with metadata.Metadata(self.metadata_config) as m:
           partial_run_utils.snapshot(m, pipeline_pb_run_2)
@@ -1367,21 +1501,17 @@ class PartialRunTest(absltest.TestCase):
     This test checks that after the first successful cache execution, following
     reuse_node_execution attempts will be no-op.
     """
-    # pylint: disable=no-value-for-parameter
     load = Load(start_num=1)
     add_num = AddNum(to_add=1, num=load.outputs['num'])
     result = Result(result=add_num.outputs['added_num'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_1 = self.make_pipeline(
         components=[load, add_num, result], run_id='run_1')
     beam_dag_runner.BeamDagRunner().run_with_ir(pipeline_pb_run_1)
     self.assertResultEqual(pipeline_pb_run_1, 2)
 
-    # pylint: disable=no-value-for-parameter
+    load = Load(start_num=1)
     add_num_v2 = AddNum(to_add=5, num=load.outputs['num'])
-    load.remove_downstream_node(add_num)  # This line is important.
     result_v2 = Result(result=add_num_v2.outputs['added_num'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_2 = self.make_pipeline(
         components=[load, add_num_v2, result_v2], run_id='run_2')
 
@@ -1427,11 +1557,9 @@ class PartialRunTest(absltest.TestCase):
     #          -------        ---------        ---------
     #
     ############################################################################
-    # pylint: disable=no-value-for-parameter
     load = Load(start_num=1)
     add_num = AddNum(to_add=1, num=load.outputs['num'])
     result = Result(result=add_num.outputs['added_num'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_1 = self.make_pipeline(
         components=[load, add_num, result], run_id='run_1')
     beam_dag_runner.BeamDagRunner().run_with_ir(pipeline_pb_run_1)
@@ -1447,11 +1575,9 @@ class PartialRunTest(absltest.TestCase):
     #          -------        ---------        ---------
     #
     ############################################################################
-    # pylint: disable=no-value-for-parameter
+    load = Load(start_num=1)
     add_num_v2 = AddNum(to_add=5, num=load.outputs['num'])
-    load.remove_downstream_node(add_num)  # This line is important.
     result_v2 = Result(result=add_num_v2.outputs['added_num'])
-    # pylint: enable=no-value-for-parameter
     # NOTE: pipeline_pb_run_2's pipeline_run_id RuntimeParameter is still
     # unresolved.
     pipeline_pb_run_2 = self.make_pipeline(
@@ -1501,11 +1627,9 @@ class PartialRunTest(absltest.TestCase):
     #          -------        ---------        ---------
     #
     ############################################################################
-    # pylint: disable=no-value-for-parameter
     load = Load(start_num=1)
     add_num = AddNum(to_add=1, num=load.outputs['num'])
     result = Result(result=add_num.outputs['added_num'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_1 = self.make_pipeline(
         components=[load, add_num, result], run_id='run_1')
     beam_dag_runner.BeamDagRunner().run_with_ir(pipeline_pb_run_1)
@@ -1521,11 +1645,9 @@ class PartialRunTest(absltest.TestCase):
     #          -------        ---------        ---------
     #
     ############################################################################
-    # pylint: disable=no-value-for-parameter
+    load = Load(start_num=1)
     add_num_v2 = AddNum(to_add=5, num=load.outputs['num'])
-    load.remove_downstream_node(add_num)  # This line is important.
     result_v2 = Result(result=add_num_v2.outputs['added_num'])
-    # pylint: enable=no-value-for-parameter
     pipeline_pb_run_2 = self.make_pipeline(
         components=[load, add_num_v2, result_v2], run_id='run_2')
 
@@ -1600,7 +1722,3 @@ class PartialRunTest(absltest.TestCase):
         pipeline_pb_run_2, from_nodes=[add_num_1_v2.id])
     beam_dag_runner.BeamDagRunner().run_with_ir(pipeline_pb_run_2)
     self.assertResultEqual(pipeline_pb_run_2, [(result_1_v2.id, 6)])
-
-
-if __name__ == '__main__':
-  absltest.main()

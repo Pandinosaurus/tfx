@@ -5,10 +5,11 @@ data. It can detect different classes of anomalies in the data. For example it
 can:
 
 1.  perform validity checks by comparing data statistics against a schema that
-    codifies expectations of the user
+    codifies expectations of the user.
 1.  detect training-serving skew by comparing training and serving
     data.
 1.  detect data drift by looking at a series of data.
+1.  perform [custom validations](https://github.com/tensorflow/data-validation/blob/master/g3doc/custom_data_validation.md) using a SQL-based configuration.
 
 The ExampleValidator pipeline component identifies any anomalies in the example data
 by comparing data statistics computed by the StatisticsGen pipeline component against a
@@ -37,4 +38,4 @@ validate_stats = ExampleValidator(
 ```
 
 More details are available in the
-[ExampleValidator API reference](https://www.tensorflow.org/tfx/api_docs/python/tfx/v1/components/ExampleValidator).
+[ExampleValidator API reference][tfx.v1.components.ExampleValidator].

@@ -41,7 +41,7 @@ training process. Common feature transformations include:
     vocabulary) into dense features by finding a meaningful mapping from high-
     dimensional space to low dimensional space. See the [Embeddings unit in the
     Machine-learning Crash Course](
-    https://developers.google.com/machine-learning/crash-course/embedding)
+    https://developers.google.com/machine-learning/crash-course/embeddings)
     for an introduction to embeddings.
 *   **Vocabulary generation**: converting strings or other non-numeric features
     into integers by creating a vocabulary that maps each unique value to an ID
@@ -78,8 +78,9 @@ By contrast, TensorFlow Transform is designed for transformations that require a
 full pass over the data to compute values that are not known in advance. For
 example, vocabulary generation requires a full pass over the data.
 
-Note: These computations are implemented in [Apache Beam](https://beam.apache.org/)
-under the hood.
+!!! Note
+    These computations are implemented in [Apache Beam](https://beam.apache.org/)
+    under the hood.
 
 In addition to computing values using Apache Beam, TensorFlow Transform allows
 users to embed these values into a TensorFlow graph, which can then be loaded
@@ -125,7 +126,7 @@ disk.  As a TFX user, you only have to define a single function called the
 In `preprocessing_fn` you define a series of functions that manipulate the input
 dict of tensors to produce the output dict of tensors. You can find helper
 functions like scale_to_0_1 and compute_and_apply_vocabulary the
-[TensorFlow Transform API](/tfx/transform/api_docs/python/tft) or use
+[TensorFlow Transform API](https://www.tensorflow.org/tfx/transform/api_docs/python/tft) or use
 regular TensorFlow functions as shown below.
 
 ```python
@@ -175,36 +176,14 @@ def preprocessing_fn(inputs):
 ### Understanding the inputs to the preprocessing_fn
 
 The `preprocessing_fn` describes a series of operations on tensors (that is,
-`Tensor`s or `SparseTensor`s) and so to write the `preprocessing_fn` correctly
-it is necessary to understand how your data is represented as tensors. The input
-to the `preprocessing_fn` is determined by the schema. A `Schema` proto contains
-a list of `Feature`s, and Transform converts these to a "feature spec"
-(sometimes called a "parsing spec") which is a dict whose keys are feature names
-and whose values are one of `FixedLenFeature` or `VarLenFeature` (or other
-options not used by TensorFlow Transform).
-
-The rules for inferring a feature spec from the `Schema` are
-
--   Each `feature` with `shape` set will result in a `tf.FixedLenFeature` with
-    shape and `default_value=None`.  `presence.min_fraction` must be `1`
-    otherwise and error will result, since when there is no default value, a
-    `tf.FixedLenFeature` requires the feature to always be present.
--   Each `feature` with `shape` not set will result in a `VarLenFeature`.
--   Each `sparse_feature` will result in a `tf.SparseFeature` whose `size` and
-    `is_sorted` are determined by the `fixed_shape` and `is_sorted` fields of
-    the `SparseFeature` message.
--   Features used as the `index_feature` or `value_feature` of a
-    `sparse_feature` will not have their own entry generated in the feature
-    spec.
--   The correspondence between `type` field of the `feature` (or the values
-    feature of a `sparse_feature` proto) and the `dtype` of the feature spec is
-    given by the following table:
-
-`type`             | `dtype`
------------------- | ------------
-`schema_pb2.INT`   | `tf.int64`
-`schema_pb2.FLOAT` | `tf.float32`
-`schema_pb2.BYTES` | `tf.string`
+`Tensor`s, `SparseTensor`s, or `RaggedTensor`s). In order to define the
+`preprocessing_fn` correctly it is necessary to understand how the data is
+represented as tensors. The input to the `preprocessing_fn` is determined by the
+schema. A
+[`Schema` proto](https://github.com/tensorflow/metadata/blob/master/tensorflow_metadata/proto/v0/schema.proto#L72)
+is eventually converted to a "feature spec" (sometimes called a "parsing spec")
+that is used for data parsing, see more details about the conversion logic
+[here](https://github.com/tensorflow/tfx-bsl/blob/master/tfx_bsl/docs/schema_interpretation.md).
 
 ## Using TensorFlow Transform to handle string labels
 
@@ -271,12 +250,14 @@ def create_estimator(pipeline_inputs, hparams):
 ```
 
 ## Configuring pre-transform and post-transform statistics
+
 As mentioned above, the Transform component invokes TFDV to compute both
 pre-transform and post-transform statistics. TFDV takes as input an optional
-[StatsOptions](https://github.com/tensorflow/datavalidation/blob/master/tensorflow_data_validation/statistics/stats_options.py) object. Users may wish to configure this object to enable certain additonal
+[StatsOptions](https://github.com/tensorflow/data-validation/blob/master/tensorflow_data_validation/statistics/stats_options.py)
+object. Users may wish to configure this object to enable certain additional
 statistics (e.g. NLP statistics) or to set thresholds that are validated (e.g.
-min / max token frequency). To do so, define a `stats_options_updater_fn`
-in the module file.
+min / max token frequency). To do so, define a `stats_options_updater_fn` in the
+module file.
 
 ```python
 def stats_options_updater_fn(stats_type, stats_options):

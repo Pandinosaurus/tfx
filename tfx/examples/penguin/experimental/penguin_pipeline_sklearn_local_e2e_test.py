@@ -14,16 +14,16 @@
 """E2E Tests for tfx.examples.experimental.penguin_pipeline_sklearn_local."""
 
 import os
-import unittest
 
 import tensorflow as tf
 from tfx import v1 as tfx
 from tfx.examples.penguin.experimental import penguin_pipeline_sklearn_local
 from tfx.orchestration import metadata
 
+import pytest
 
-@unittest.skipIf(tf.__version__ < '2',
-                 'Uses keras Model only compatible with TF 2.x')
+
+@pytest.mark.e2e
 class PenguinPipelineSklearnLocalEndToEndTest(tf.test.TestCase):
 
   def setUp(self):
@@ -57,7 +57,6 @@ class PenguinPipelineSklearnLocalEndToEndTest(tf.test.TestCase):
 
   def assertPipelineExecution(self) -> None:
     self.assertExecutedOnce('CsvExampleGen')
-    self.assertExecutedOnce('Evaluator')
     self.assertExecutedOnce('ExampleValidator')
     self.assertExecutedOnce('Pusher')
     self.assertExecutedOnce('SchemaGen')
@@ -78,7 +77,7 @@ class PenguinPipelineSklearnLocalEndToEndTest(tf.test.TestCase):
 
     self.assertTrue(tfx.dsl.io.fileio.exists(self._serving_model_dir))
     self.assertTrue(tfx.dsl.io.fileio.exists(self._metadata_path))
-    expected_execution_count = 8  # 7 components + 1 resolver
+    expected_execution_count = 7  # 6 components + 1 resolver
     metadata_config = (
         tfx.orchestration.metadata.sqlite_metadata_connection_config(
             self._metadata_path))
@@ -89,8 +88,3 @@ class PenguinPipelineSklearnLocalEndToEndTest(tf.test.TestCase):
       self.assertEqual(expected_execution_count, execution_count)
 
     self.assertPipelineExecution()
-
-
-if __name__ == '__main__':
-  tf.compat.v1.enable_v2_behavior()
-  tf.test.main()

@@ -17,7 +17,6 @@ Note: these APIs are **experimental** and major changes to interface and
 functionality are expected.
 """
 
-import abc
 import builtins
 import html
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
@@ -33,6 +32,9 @@ STATIC_HTML_CONTENTS = u"""<style>
   background: white;
   border: 1px solid #bbbbbb;
   box-shadow: 4px 4px 2px rgba(0,0,0,0.05);
+}
+html[theme=dark] .tfx-object.expanded {
+  background: black;
 }
 .tfx-object, .tfx-object * {
   font-size: 11pt;
@@ -64,6 +66,9 @@ STATIC_HTML_CONTENTS = u"""<style>
 .tfx-object table.attr-table {
   border: 2px solid white;
   margin-top: 5px;
+}
+html[theme=dark] .tfx-object table.attr-table {
+  border: 2px solid black;
 }
 .tfx-object table.attr-table td.attr-name {
   vertical-align: top;
@@ -180,8 +185,8 @@ class NotebookFormatter:
       formatted_value = self.render_dict(value, seen_elements)
     if isinstance(value, list):
       formatted_value = self.render_list(value, seen_elements)
-    if value.__class__ != abc.ABCMeta:
-      # abc.ABCMeta.mro() does not work.
+    if not issubclass(value.__class__, type):
+      # Metaclass does not have mro().
       for cls in value.__class__.mro():
         if cls in FORMATTER_REGISTRY:
           formatted_value = FORMATTER_REGISTRY[cls].render(
